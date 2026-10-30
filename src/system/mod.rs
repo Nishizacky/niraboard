@@ -3,6 +3,7 @@ pub mod backlight;
 pub mod battery;
 pub mod command;
 pub mod cpu;
+pub mod disk;
 pub mod memory;
 pub mod network;
 pub mod power_profile;
@@ -12,6 +13,7 @@ pub use audio::Audio;
 pub use backlight::Brightness;
 pub use battery::{Battery, ChargeState};
 pub use cpu::Cpu;
+pub use disk::Disk;
 pub use memory::Memory;
 pub use network::Wifi;
 pub use power_profile::PowerProfile;
@@ -33,6 +35,7 @@ pub struct Metrics {
     pub battery: Option<Battery>,
     pub cpu: Cpu,
     pub memory: Option<Memory>,
+    pub disk: Option<Disk>,
     pub wifi: Option<Wifi>,
     pub local_ip: Option<String>,
     pub public_ip: Option<String>,
@@ -122,6 +125,7 @@ impl Monitor {
     fn read_fast(&mut self) {
         self.metrics.cpu = cpu::read(&mut self.cpu);
         self.metrics.memory = memory::read();
+        self.metrics.disk = disk::read();
         self.metrics.brightness = backlight::read();
         self.read_battery();
     }
@@ -195,5 +199,5 @@ pub fn identity() -> String {
 
     sysfs::read_string("/proc/sys/kernel/hostname")
         .filter(|hostname| !hostname.is_empty())
-        .unwrap_or_else(|| "laptop".to_owned())
+        .unwrap_or_else(|| "unknown hostname".to_owned())
 }

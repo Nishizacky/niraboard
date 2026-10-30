@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use ratatui::style::Color;
 use serde::Deserialize;
 
-use crate::app::LayoutMode;
+use crate::app::{Card, LayoutMode};
 
 const DEFAULT_MAIN_COLOR: Color = Color::Cyan;
 const DEFAULT_BAR_COLOR: Color = Color::Green;
@@ -63,11 +63,24 @@ impl Steps {
 }
 
 /// User configuration loaded from `config.toml`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub colors: Colors,
     pub layout: LayoutMode,
     pub steps: Steps,
+    /// Cards in display order. Cards that do not fit on screen are not drawn.
+    pub cards: Vec<Card>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            colors: Colors::default(),
+            layout: LayoutMode::default(),
+            steps: Steps::default(),
+            cards: Card::ALL.to_vec(),
+        }
+    }
 }
 
 impl Config {
@@ -120,6 +133,10 @@ impl Config {
             config.steps.volume = parse_step(value, "steps.volume")?;
         }
 
+        if let Some(cards) = raw.cards {
+            config.cards = parse_cards(&cards)?;
+        }
+
         Ok(config)
     }
 }
@@ -156,6 +173,23 @@ fn parse_step(value: u8, key: &str) -> Result<u8> {
     Ok(value)
 }
 
+fn parse_cards(names: &[String]) -> Result<Vec<Card>> {
+    let mut cards = Vec::with_capacity(names.len());
+
+    for (index, name) in names.iter().enumerate() {
+        let card = Card::from_name(name)
+            .with_context(|| format!("invalid card `{name}` at cards[{index}]"))?;
+
+        if cards.contains(&card) {
+            bail!("duplicate card `{}` at cards[{index}]", card.name());
+        }
+
+        cards.push(card);
+    }
+
+    Ok(cards)
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
@@ -164,6 +198,7 @@ struct RawConfig {
     layout: Option<String>,
     #[serde(default)]
     steps: RawSteps,
+    cards: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -214,6 +249,34 @@ mod tests {
         assert_eq!(config.layout, LayoutMode::TwoColumns);
         assert_eq!(config.steps.brightness, 10);
         assert_eq!(config.steps.volume, 2);
+    }
+
+    #[test]
+    fn parses_card_order() {
+        let config = Config::parse(r#"cards = ["audio", "cpu", "battery"]"#).expect("valid cards");
+
+        assert_eq!(config.cards, vec![Card::Audio, Card::Cpu, Card::Battery]);
+    }
+
+    #[test]
+    fn defaults_to_every_card_in_dashboard_order() {
+        let config = Config::parse("").expect("empty config");
+
+        assert_eq!(config.cards, Card::ALL.to_vec());
+    }
+
+    #[test]
+    fn rejects_unknown_card() {
+        let error = Config::parse(r#"cards = ["cpu", "gpu"]"#).expect_err("unknown card");
+
+        assert!(format!("{error:#}").contains("invalid card `gpu`"));
+    }
+
+    #[test]
+    fn rejects_duplicate_card() {
+        let error = Config::parse(r#"cards = ["cpu", "cpu"]"#).expect_err("duplicate card");
+
+        assert!(format!("{error:#}").contains("duplicate card `cpu`"));
     }
 
     #[test]

@@ -10,6 +10,21 @@
 # "2-columns", or "3-columns".
 layout = "vertical"
 
+# Cards in display order. Available names:
+# "battery", "cpu", "memory", "disk", "network", "power", "brightness", "audio".
+# Remove a name to hide that card. Cards are drawn in this order; any card
+# that does not fit on the current screen is not shown.
+cards = [
+    "battery",
+    "cpu",
+    "memory",
+    "disk",
+    "network",
+    "power",
+    "brightness",
+    "audio",
+]
+
 [colors]
 # Accent used for the header, focused borders, buttons, and key hints.
 # Accepts colour names (cyan, light-blue, ...), an ANSI index (0-255),

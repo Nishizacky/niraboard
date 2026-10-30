@@ -40,6 +40,63 @@ impl Focus {
     }
 }
 
+/// A dashboard card. The order of [`Config::cards`](crate::config::Config::cards)
+/// decides where each one is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Card {
+    Battery,
+    Cpu,
+    Memory,
+    Disk,
+    Network,
+    Power,
+    Brightness,
+    Audio,
+}
+
+impl Card {
+    pub const ALL: [Self; 8] = [
+        Self::Battery,
+        Self::Cpu,
+        Self::Memory,
+        Self::Disk,
+        Self::Network,
+        Self::Power,
+        Self::Brightness,
+        Self::Audio,
+    ];
+
+    /// Parse a card name from the configuration file.
+    pub fn from_name(name: &str) -> Option<Self> {
+        let normalized = name.to_ascii_lowercase().replace([' ', '-', '_'], "");
+
+        match normalized.as_str() {
+            "battery" => Some(Self::Battery),
+            "cpu" => Some(Self::Cpu),
+            "memory" | "ram" => Some(Self::Memory),
+            "disk" | "storage" | "filesystem" => Some(Self::Disk),
+            "network" | "wifi" => Some(Self::Network),
+            "power" | "profile" | "powerprofile" => Some(Self::Power),
+            "brightness" | "backlight" => Some(Self::Brightness),
+            "audio" | "volume" => Some(Self::Audio),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Battery => "battery",
+            Self::Cpu => "cpu",
+            Self::Memory => "memory",
+            Self::Disk => "disk",
+            Self::Network => "network",
+            Self::Power => "power",
+            Self::Brightness => "brightness",
+            Self::Audio => "audio",
+        }
+    }
+}
+
 /// How the dashboard cards are arranged on screen.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LayoutMode {
@@ -203,36 +260,25 @@ impl App {
             return false;
         }
 
+        if self.show_quit_confirmation {
+            // Only y confirms; every other key cancels so stray presses never quit.
+            let yes = matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'));
+            return self.confirm_quit(yes);
+        }
+
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
         {
-            if self.show_quit_confirmation {
-                self.confirm_quit(true);
-            } else {
-                self.show_quit_confirmation = true;
-            }
+            self.show_quit_confirmation = true;
             return true;
         }
 
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
-                if self.show_quit_confirmation {
-                    self.confirm_quit(true);
-                } else {
-                    self.show_quit_confirmation = true;
-                }
+                self.show_quit_confirmation = true;
                 true
             }
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                if self.show_quit_confirmation {
-                    self.confirm_quit(true);
-                }
-                true
-            }
-            KeyCode::Char('n') | KeyCode::Char('N') => {
-                if self.show_quit_confirmation {
-                    self.confirm_quit(false);
-                }
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('n') | KeyCode::Char('N') => {
                 true
             }
             KeyCode::Tab => {
@@ -287,6 +333,10 @@ impl App {
     fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
         if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
             return false;
+        }
+
+        if self.show_quit_confirmation {
+            return self.confirm_quit(false);
         }
 
         let Some(action) = self.hits.action_at(mouse.column, mouse.row) else {

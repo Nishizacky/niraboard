@@ -9,6 +9,7 @@ pub struct Cpu {
     pub usage_percent: Option<u8>,
     pub temp_c: Option<f32>,
     pub freq_mhz: Option<u32>,
+    pub model: Option<String>,
     pub threads: usize,
 }
 
@@ -56,10 +57,12 @@ impl Sampler {
 }
 
 pub fn read(sampler: &mut Sampler) -> Cpu {
+    let info = read_cpuinfo();
     Cpu {
         usage_percent: sampler.sample(),
         temp_c: read_temp_c(),
-        freq_mhz: read_freq_mhz(),
+        freq_mhz: info.freq_mhz,
+        model: info.model,
         threads: thread::available_parallelism()
             .map(|threads| threads.get())
             .unwrap_or(0),
@@ -88,25 +91,63 @@ fn parse_stat(text: &str) -> Option<Sample> {
     Some(Sample { total, idle })
 }
 
-fn read_freq_mhz() -> Option<u32> {
-    let cpuinfo = fs::read_to_string("/proc/cpuinfo").ok()?;
+#[derive(Debug, Default)]
+struct CpuInfo {
+    model: Option<String>,
+    freq_mhz: Option<u32>,
+}
+
+fn read_cpuinfo() -> CpuInfo {
+    let Ok(cpuinfo) = fs::read_to_string("/proc/cpuinfo") else {
+        return CpuInfo::default();
+    };
+    parse_cpuinfo(&cpuinfo)
+}
+
+/// Extract the human-readable model name and the average current frequency.
+/// x86 kernels expose `model name`, while many ARM kernels only provide
+/// `Hardware` or `Processor`.
+fn parse_cpuinfo(text: &str) -> CpuInfo {
+    let mut model = None;
+    let mut fallback = None;
     let mut total = 0.0;
     let mut count = 0_u32;
 
-    for line in cpuinfo.lines() {
+    for line in text.lines() {
         let Some((key, value)) = line.split_once(':') else {
             continue;
         };
-        if key.trim() != "cpu MHz" {
-            continue;
-        }
-        if let Ok(frequency) = value.trim().parse::<f64>() {
-            total += frequency;
-            count += 1;
+        let value = value.trim();
+        match key.trim() {
+            "model name" if model.is_none() && !value.is_empty() => {
+                model = normalize_model(value);
+            }
+            "Hardware" | "Processor" if fallback.is_none() && !value.is_empty() => {
+                fallback = normalize_model(value);
+            }
+            "cpu MHz" => {
+                if let Ok(frequency) = value.parse::<f64>() {
+                    total += frequency;
+                    count += 1;
+                }
+            }
+            _ => {}
         }
     }
 
-    (count > 0).then(|| (total / f64::from(count)).round() as u32)
+    CpuInfo {
+        model: model.or(fallback),
+        freq_mhz: (count > 0).then(|| (total / f64::from(count)).round() as u32),
+    }
+}
+
+fn normalize_model(raw: &str) -> Option<String> {
+    let model = raw.replace("(R)", "").replace("(TM)", "");
+    let model = model
+        .split_once(" CPU @")
+        .map_or(model.as_str(), |(head, _)| head);
+    let model = model.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!model.is_empty()).then_some(model)
 }
 
 fn read_temp_c() -> Option<f32> {
@@ -221,5 +262,42 @@ mod tests {
     fn converts_millidegrees() {
         assert_eq!(millidegrees_to_celsius(42_000), Some(42.0));
         assert_eq!(millidegrees_to_celsius(42), None);
+    }
+
+    #[test]
+    fn parses_model_name_and_average_frequency() {
+        let text = "\
+processor\t: 0
+model name\t: Intel(R) Core(TM) i7-8550U CPU @ 1.80GHz
+cpu MHz\t\t: 1800.000
+
+processor\t: 1
+model name\t: Intel(R) Core(TM) i7-8550U CPU @ 1.80GHz
+cpu MHz\t\t: 2000.000
+";
+
+        let info = parse_cpuinfo(text);
+        assert_eq!(info.model.as_deref(), Some("Intel Core i7-8550U"));
+        assert_eq!(info.freq_mhz, Some(1900));
+    }
+
+    #[test]
+    fn falls_back_to_hardware_for_arm_kernels() {
+        let text = "processor\t: 0\nHardware\t: BCM2835\n";
+
+        let info = parse_cpuinfo(text);
+        assert_eq!(info.model.as_deref(), Some("BCM2835"));
+        assert_eq!(info.freq_mhz, None);
+    }
+
+    #[test]
+    fn ignores_empty_and_duplicate_models() {
+        let text = "model name\t: \nmodel name\t: AMD Ryzen 7 5800X 8-Core Processor\n";
+
+        let info = parse_cpuinfo(text);
+        assert_eq!(
+            info.model.as_deref(),
+            Some("AMD Ryzen 7 5800X 8-Core Processor")
+        );
     }
 }

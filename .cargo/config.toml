@@ -1,0 +1,6 @@
+# Build settings for local development.
+
+# Use the mold linker on Linux for much faster linking.
+# mold must be installed (e.g. `apt install mold` / `pacman -S mold`).
+[target.'cfg(target_os = "linux")']
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

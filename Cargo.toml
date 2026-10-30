@@ -8,6 +8,7 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1.0"
+libc = "0.2"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"

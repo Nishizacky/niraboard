@@ -4,7 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Gauge, Paragraph};
 
-use crate::app::{App, Focus, LayoutMode, StatusLevel};
+use crate::app::{App, Card, Focus, LayoutMode, StatusLevel};
 use crate::config::{Colors, Steps};
 use crate::system::{Battery, ChargeState, PowerProfile};
 
@@ -16,7 +16,6 @@ const LABEL: Color = Color::Gray;
 
 const MIN_WIDTH: u16 = 72;
 const MIN_HEIGHT: u16 = 22;
-const CARD_COUNT: usize = 7;
 const COLUMN_GAP: u16 = 1;
 
 /// Screen rectangles recorded during rendering so mouse events can be mapped
@@ -123,17 +122,23 @@ pub fn draw(frame: &mut Frame, app: &App) -> HitAreas {
 }
 
 fn draw_body(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitAreas, colors: Colors) {
-    match app.layout {
-        LayoutMode::Vertical => draw_grid(frame, area, app, hits, 1, colors),
-        LayoutMode::Horizontal => draw_grid(frame, area, app, hits, CARD_COUNT, colors),
-        LayoutMode::TwoColumns => draw_grid(frame, area, app, hits, 2, colors),
-        LayoutMode::ThreeColumns => draw_grid(frame, area, app, hits, 3, colors),
-    }
+    let columns = match app.layout {
+        LayoutMode::Vertical => 1,
+        LayoutMode::Horizontal => app.config.cards.len().max(1),
+        LayoutMode::TwoColumns => 2,
+        LayoutMode::ThreeColumns => 3,
+    };
+
+    draw_grid(frame, area, app, hits, columns, colors);
 }
 
-/// Arrange every card in a row-major grid. Columns always receive exactly the
+/// Arrange the configured cards in a row-major grid, in the order given by the
+/// `cards` array in the configuration file. Columns always receive exactly the
 /// same width so two- and three-column layouts line up cleanly; any leftover
 /// cells are absorbed by the gaps rather than by one of the cards.
+///
+/// Cards that would fall outside the screen are skipped instead of being
+/// squeezed into the visible area.
 fn draw_grid(
     frame: &mut Frame,
     area: Rect,
@@ -142,47 +147,71 @@ fn draw_grid(
     columns: usize,
     colors: Colors,
 ) {
-    if area.is_empty() {
+    let cards = &app.config.cards;
+
+    if area.is_empty() || cards.is_empty() {
         return;
     }
 
-    let columns = columns.clamp(1, CARD_COUNT);
-    let rows = CARD_COUNT.div_ceil(columns);
-    let column_gap = if columns > 1 { COLUMN_GAP } else { 0 };
-    let columns_spans = equal_spans(area.x, area.width, columns, column_gap);
-    let row_spans = equal_spans(area.y, area.height, rows, 0);
-
-    for index in 0..CARD_COUNT {
-        let (x, width) = columns_spans[index % columns];
-        let (y, height) = row_spans[index / columns];
-        draw_card(
-            frame,
-            index,
-            Rect::new(x, y, width, height),
-            app,
-            hits,
-            colors,
-        );
+    for (card, card_area) in cards.iter().zip(card_rects(area, columns, cards.len())) {
+        draw_card(frame, *card, card_area, app, hits, colors);
     }
+}
+
+/// Compute the rectangles for the configured cards in row-major order.
+///
+/// Cards that would fall outside the screen are omitted instead of being
+/// squeezed into the visible area.
+fn card_rects(area: Rect, columns: usize, count: usize) -> Vec<Rect> {
+    if area.is_empty() || count == 0 {
+        return Vec::new();
+    }
+
+    let columns = columns.clamp(1, count);
+    let rows = count.div_ceil(columns);
+    let column_gap = if columns > 1 { COLUMN_GAP } else { 0 };
+    let column_spans = equal_spans(area.x, area.width, columns, column_gap);
+    // Only draw whole rows that fit within the body. `rows` can exceed the
+    // available height, so cards below the last visible row are omitted.
+    let visible_rows = rows.min(area.height as usize);
+    let row_spans = equal_spans(area.y, area.height, visible_rows, 0);
+
+    let mut rects = Vec::with_capacity(count);
+
+    for index in 0..count {
+        let Some(&(y, height)) = row_spans.get(index / columns) else {
+            continue;
+        };
+        let Some(&(x, width)) = column_spans.get(index % columns) else {
+            continue;
+        };
+        let rect = Rect::new(x, y, width, height);
+
+        if !rect.is_empty() {
+            rects.push(rect);
+        }
+    }
+
+    rects
 }
 
 fn draw_card(
     frame: &mut Frame,
-    index: usize,
+    card: Card,
     area: Rect,
     app: &App,
     hits: &mut HitAreas,
     colors: Colors,
 ) {
-    match index {
-        0 => draw_battery(frame, area, app, colors),
-        1 => draw_cpu(frame, area, app, colors),
-        2 => draw_memory(frame, area, app, colors),
-        3 => draw_wifi(frame, area, app, hits, colors),
-        4 => draw_power(frame, area, app, hits, colors),
-        5 => draw_brightness(frame, area, app, hits, colors),
-        6 => draw_audio(frame, area, app, hits, colors),
-        _ => {}
+    match card {
+        Card::Battery => draw_battery(frame, area, app, colors),
+        Card::Cpu => draw_cpu(frame, area, app, colors),
+        Card::Memory => draw_memory(frame, area, app, colors),
+        Card::Disk => draw_disk(frame, area, app, colors),
+        Card::Network => draw_wifi(frame, area, app, hits, colors),
+        Card::Power => draw_power(frame, area, app, hits, colors),
+        Card::Brightness => draw_brightness(frame, area, app, hits, colors),
+        Card::Audio => draw_audio(frame, area, app, hits, colors),
     }
 }
 
@@ -238,7 +267,6 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitAreas, co
             app.identity.as_str(),
             Style::default().fg(LABEL).add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  ·  laptop power", Style::default().fg(DIM)),
     ]);
     frame.render_widget(Paragraph::new(title), columns[0]);
 
@@ -403,29 +431,35 @@ fn draw_cpu(frame: &mut Frame, area: Rect, app: &App, colors: Colors) {
         .map(|frequency| format!("{:.2} GHz", frequency as f32 / 1000.0))
         .unwrap_or_else(|| "—".to_owned());
     let threads = if cpu.threads > 0 {
-        format!("{} threads", cpu.threads)
+        cpu.threads.to_string()
     } else {
         "—".to_owned()
     };
+    let model = cpu.model.as_deref().unwrap_or("—");
+    let model = fit(model, inner.width.saturating_sub(8));
 
     let lines = vec![
         Line::from(vec![
-            Span::styled("Usage ", Style::default().fg(DIM)),
+            Span::styled("Usage   ", Style::default().fg(DIM)),
             Span::styled(
                 usage,
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(vec![
-            Span::styled("Temp  ", Style::default().fg(DIM)),
+            Span::styled("Temp    ", Style::default().fg(DIM)),
             Span::styled(temperature, Style::default().fg(temperature_color)),
             Span::raw("   "),
             Span::styled("Freq  ", Style::default().fg(DIM)),
             Span::styled(frequency, Style::default().fg(LABEL)),
         ]),
         Line::from(vec![
-            Span::styled("Cores ", Style::default().fg(DIM)),
+            Span::styled("Threads ", Style::default().fg(DIM)),
             Span::styled(threads, Style::default().fg(LABEL)),
+        ]),
+        Line::from(vec![
+            Span::styled("Model   ", Style::default().fg(DIM)),
+            Span::styled(model, Style::default().fg(LABEL)),
         ]),
     ];
     frame.render_widget(Paragraph::new(lines), rows[1]);
@@ -471,6 +505,49 @@ fn draw_memory(frame: &mut Frame, area: Rect, app: &App, colors: Colors) {
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
             Span::styled(" available", Style::default().fg(DIM)),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines), rows[1]);
+}
+
+fn draw_disk(frame: &mut Frame, area: Rect, app: &App, colors: Colors) {
+    let block = card("Disk", false, colors);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let Some(disk) = app.monitor.metrics.disk.as_ref() else {
+        centered_message(frame, inner, &["Disk unavailable"], DIM);
+        return;
+    };
+    if inner.is_empty() {
+        return;
+    }
+
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).split(inner);
+    let color = usage_color(disk.percent, 70, 90, colors.bar);
+    render_gauge(
+        frame,
+        rows[0],
+        disk.percent.into(),
+        &format!("{}%", disk.percent),
+        color,
+    );
+
+    let used = gib(disk.used_bytes);
+    let total = gib(disk.total_bytes);
+    let filesystem = format!("{} · {}", disk.filesystem, disk.mount);
+    let filesystem = fit(&filesystem, inner.width.saturating_sub(8));
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("Used  ", Style::default().fg(DIM)),
+            Span::styled(
+                format!("{used:.1} / {total:.1} GiB"),
+                Style::default().fg(LABEL),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("FS    ", Style::default().fg(DIM)),
+            Span::styled(filesystem, Style::default().fg(LABEL)),
         ]),
     ];
     frame.render_widget(Paragraph::new(lines), rows[1]);
@@ -912,7 +989,7 @@ fn draw_quit_confirmation(frame: &mut Frame, area: Rect, colors: Colors) {
 
     let lines = vec![
         Line::from(vec![Span::styled(
-            "Quit? (q|y)/n",
+            "Quit? y",
             Style::default().fg(WARN).add_modifier(Modifier::BOLD),
         )]),
         Line::from(vec![
@@ -975,11 +1052,27 @@ fn gib(bytes: u64) -> f64 {
     bytes as f64 / 1024.0 / 1024.0 / 1024.0
 }
 
+/// Clamp a value to `width` columns, marking the cut with an ellipsis.
+fn fit(text: &str, width: u16) -> String {
+    let width = width as usize;
+    let length = text.chars().count();
+    if length <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+
+    let mut fitted: String = text.chars().take(width - 1).collect();
+    fitted.push('…');
+    fitted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::App;
-    use crate::system::{Audio, Battery, Brightness, ChargeState};
+    use crate::system::{Audio, Battery, Brightness, ChargeState, Disk};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -988,29 +1081,18 @@ mod tests {
     }
 
     fn render_layout(width: u16, height: u16, layout: LayoutMode) -> (String, HitAreas) {
-        let mut app = App::new();
+        render_cards(width, height, layout, Card::ALL.to_vec())
+    }
+
+    fn render_cards(
+        width: u16,
+        height: u16,
+        layout: LayoutMode,
+        cards: Vec<Card>,
+    ) -> (String, HitAreas) {
+        let mut app = test_app();
         app.layout = layout;
-        app.monitor.metrics.battery = Some(Battery {
-            percent: 79,
-            state: ChargeState::Discharging,
-            power_w: Some(4.2),
-            health_percent: Some(83),
-            energy_now_wh: Some(29.9),
-            energy_full_wh: Some(37.9),
-            ac_online: false,
-        });
-        app.monitor.metrics.audio = Some(Audio {
-            volume_percent: 40,
-            muted: false,
-        });
-        app.monitor.metrics.brightness = Some(Brightness {
-            percent: 50,
-            raw: 375,
-            max: 7500,
-            device: "intel_backlight".to_owned(),
-        });
-        app.monitor.metrics.local_ip = Some("192.168.1.42".to_owned());
-        app.monitor.metrics.public_ip = Some("203.0.113.7".to_owned());
+        app.config.cards = cards;
 
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -1024,6 +1106,42 @@ mod tests {
         (format!("{}", terminal.backend()), hits)
     }
 
+    fn test_app() -> App {
+        let mut app = App::new();
+        app.monitor.metrics.battery = Some(Battery {
+            percent: 79,
+            state: ChargeState::Discharging,
+            power_w: Some(4.2),
+            health_percent: Some(83),
+            energy_now_wh: Some(29.9),
+            energy_full_wh: Some(37.9),
+            ac_online: false,
+        });
+        app.monitor.metrics.audio = Some(Audio {
+            volume_percent: 40,
+            muted: false,
+        });
+        app.monitor.metrics.cpu.model = Some("AMD Ryzen 7 5800X".to_owned());
+        app.monitor.metrics.cpu.threads = 16;
+        app.monitor.metrics.disk = Some(Disk {
+            mount: "/".to_owned(),
+            filesystem: "ext4".to_owned(),
+            total_bytes: 240 * 1024 * 1024 * 1024,
+            used_bytes: 96 * 1024 * 1024 * 1024,
+            available_bytes: 138 * 1024 * 1024 * 1024,
+            percent: 40,
+        });
+        app.monitor.metrics.brightness = Some(Brightness {
+            percent: 50,
+            raw: 375,
+            max: 7500,
+            device: "intel_backlight".to_owned(),
+        });
+        app.monitor.metrics.local_ip = Some("192.168.1.42".to_owned());
+        app.monitor.metrics.public_ip = Some("203.0.113.7".to_owned());
+        app
+    }
+
     #[test]
     fn renders_all_cards_at_80x24() {
         let (screen, hits) = render(80, 24);
@@ -1033,6 +1151,7 @@ mod tests {
             "Battery",
             "CPU",
             "Memory",
+            "Disk",
             "Network",
             "Power profile",
             "Brightness",
@@ -1049,6 +1168,48 @@ mod tests {
     }
 
     #[test]
+    fn renders_cards_in_configured_order() {
+        let (screen, _) = render_cards(
+            120,
+            60,
+            LayoutMode::Vertical,
+            vec![Card::Audio, Card::Cpu, Card::Battery],
+        );
+
+        let audio = screen.find("Audio").expect("audio card");
+        let cpu = screen.find("CPU").expect("cpu card");
+        let battery = screen.find("Battery").expect("battery card");
+
+        assert!(
+            audio < cpu && cpu < battery,
+            "wrong card order in\n{screen}"
+        );
+        assert!(!screen.contains("Memory"), "unconfigured card rendered");
+        assert!(!screen.contains("Network"), "unconfigured card rendered");
+    }
+
+    #[test]
+    fn cards_below_the_screen_are_omitted() {
+        let area = Rect::new(0, 0, 80, 10);
+        let rects = card_rects(area, 1, 20);
+
+        assert_eq!(rects.len(), 10);
+        assert!(rects.iter().all(|rect| rect.height == 1));
+        assert_eq!(rects.last().unwrap().bottom(), area.bottom());
+    }
+
+    #[test]
+    fn cards_are_omitted_from_partially_filled_rows() {
+        // Four cards in three columns need two rows. With only one row of
+        // space, the first three cards stay visible and the last is hidden.
+        let area = Rect::new(0, 0, 80, 1);
+        let rects = card_rects(area, 3, 4);
+
+        assert_eq!(rects.len(), 3);
+        assert_eq!(rects[0].width + rects[1].width + rects[2].width, 78);
+    }
+
+    #[test]
     fn renders_ip_addresses_in_the_network_card() {
         let (screen, _) = render_layout(120, 60, LayoutMode::Vertical);
 
@@ -1061,6 +1222,22 @@ mod tests {
         let (screen, hits) = render(60, 18);
         assert!(screen.contains("Terminal too small"));
         assert!(hits.profile_rows.is_empty());
+    }
+
+    #[test]
+    fn renders_cpu_model_and_threads() {
+        let (screen, _) = render_layout(120, 60, LayoutMode::Vertical);
+
+        assert!(screen.contains("Threads 16"));
+        assert!(screen.contains("AMD Ryzen 7 5800X"));
+    }
+
+    #[test]
+    fn renders_disk_usage() {
+        let (screen, _) = render_layout(120, 60, LayoutMode::Vertical);
+
+        assert!(screen.contains("Used  96.0 / 240.0 GiB"));
+        assert!(screen.contains("FS    ext4 · /"));
     }
 
     #[test]
@@ -1101,6 +1278,7 @@ mod tests {
                 "Battery",
                 "CPU",
                 "Memory",
+                "Disk",
                 "Network",
                 "Power profile",
                 "Brightness",

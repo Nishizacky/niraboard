@@ -3,7 +3,7 @@
 A compact, keyboard-first laptop power dashboard for the terminal.
 
 `niraboard` is a small Ratatui/Crossterm TUI for CachyOS/Arch laptops. It shows
-battery, CPU, memory, Wi-Fi, local/global IP addresses, power profile,
+battery, CPU, memory, disk, Wi-Fi, local/global IP addresses, power profile,
 brightness, and PipeWire volume in one screen, and lets you change the profile,
 brightness, volume, and mute state without leaving the terminal. Clicking the
 network card (or pressing `w`) opens NetworkManager's `nmtui` for connection
@@ -22,13 +22,20 @@ an optional TOML configuration file. See [Configuration](#configuration).
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭ CPU ─────────────────────────────────────────────────────────────────────────╮
 │██▉                   6%                                                      │
-│Usage 6%                                                                      │
-│Temp  42.0 °C   Freq  0.75 GHz                                                │
+│Usage   6%                                                                    │
+│Temp   42.0 °C   Freq  0.75 GHz                                               │
+│Threads 8                                                                     │
+│Model   Intel Core i7-8550U                                                   │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭ Memory ──────────────────────────────────────────────────────────────────────╮
 │██▌       11%                                                                 │
 │Used  1.6 / 15.4 GiB                                                          │
 │13.8 GiB available                                                            │
+╰──────────────────────────────────────────────────────────────────────────────╯
+╭ Disk ────────────────────────────────────────────────────────────────────────╮
+│██████████████▊                         48%                                   │
+│Used  111.8 / 233.7 GiB                                                       │
+│FS    ext4 · /                                                                │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭ Network ─────────────────────────────────────────────────────────────────────╮
 │● Connected                                                                   │
@@ -92,6 +99,12 @@ the top-right corner of the header.
 | `2 columns` | Two cards per row in a row-major grid |
 | `3 columns` | Three cards per row in a row-major grid |
 
+Cards always appear in the order of the `cards` array in the configuration
+file. The grid layouts wrap that order row by row. If the configured cards do
+not fit on the current screen, the cards that would fall outside are left out
+instead of being squeezed or scrolled; the remaining cards keep their equal
+sizes. This also applies to future cards added in later releases.
+
 In the two- and three-column layouts, every card in a column has exactly the
 same width. Leftover terminal cells are absorbed by the gaps rather than making
 one column wider than the others. The layout is not persisted between runs; set
@@ -113,6 +126,7 @@ never crash the application:
 | Integration | Used for |
 | --- | --- |
 | `/proc/stat`, `/proc/meminfo` | CPU utilisation and memory |
+| `statvfs`, `/proc/self/mounts` | Root filesystem usage and filesystem type |
 | `/sys/class/power_supply` | Battery percentage, state, power, health |
 | `/sys/class/backlight` | Brightness reading |
 | `/sys/class/hwmon`, `/sys/class/thermal` | CPU temperature |
@@ -233,6 +247,19 @@ cp examples/config.toml ~/.config/niraboard/config.toml
 # Startup layout: "vertical", "horizontal", "2-columns", or "3-columns".
 layout = "vertical"
 
+# Cards in display order. Remove a name to hide that card. Cards that do not
+# fit on screen are omitted automatically.
+cards = [
+    "battery",
+    "cpu",
+    "memory",
+    "disk",
+    "network",
+    "power",
+    "brightness",
+    "audio",
+]
+
 [colors]
 # Accent for the header, focused borders, buttons, and key hints.
 main = "cyan"
@@ -248,8 +275,8 @@ volume = 5
 
 Colours accept names (`cyan`, `light-blue`, `red`, ...), an ANSI index
 (`0`-`255`), or a hexadecimal value (`"#4fc3f7"`). Unknown keys, invalid
-colours, and steps outside 1-100 are reported in the footer; niraboard then
-starts with defaults instead of exiting.
+colours, unknown or duplicate card names, and steps outside 1-100 are reported
+in the footer; niraboard then starts with defaults instead of exiting.
 
 ## Permissions and safety
 
@@ -291,7 +318,7 @@ The event loop wakes every 2 seconds. Data collection is deliberately split:
 
 | Data | Interval | Source |
 | --- | --- | --- |
-| CPU, memory, battery, brightness | every tick (2 s) | sysfs/procfs |
+| CPU, memory, disk, battery, brightness | every tick (2 s) | sysfs/procfs, `statvfs` |
 | Audio | 4 s | `wpctl get-volume` |
 | Wi-Fi and local IP | 15 s | `nmcli ... --rescan no`, `ip -4 route get` |
 | Global IP | 300 s | `curl https://api.ipify.org` |
@@ -321,7 +348,7 @@ does not automatically mean 2-second redraws.
 src/
 ├── main.rs          terminal setup/restore, event/tick loop
 ├── app.rs           application state, focus, key/mouse handling, actions
-├── config.rs        TOML loading, colours, startup layout, step sizes
+├── config.rs        TOML loading, colours, startup layout, card order, steps
 ├── event.rs         crossterm event polling
 ├── actions.rs       profile/brightness/audio/nmtui command wrappers
 ├── ui.rs            Ratatui layout, widgets, hit areas, colours
@@ -330,8 +357,9 @@ src/
     ├── command.rs   argument-based and interactive process execution
     ├── sysfs.rs     small sysfs/procfs helpers
     ├── battery.rs   sysfs battery + UPower fallback
-    ├── cpu.rs       /proc/stat delta sampler, temperature, frequency
+    ├── cpu.rs       /proc/stat delta sampler, model, threads, temperature, frequency
     ├── memory.rs    /proc/meminfo
+    ├── disk.rs      statvfs usage and mount table filesystem type
     ├── network.rs   nmcli parsing, local/global IP lookup
     ├── audio.rs     wpctl parsing
     ├── power_profile.rs
@@ -354,9 +382,10 @@ src/
   with nested `Layout` calls. Rects are the single source of truth for both
   drawing and mouse hit-testing.
 - **`Layout` constraints**: `Length(1)` reserves the header and footer;
-  `Fill(1)` divides the remaining body between the cards. `Vertical` is one
-  card per row; the grid layouts use a small `equal_spans` helper so every
-  column has the same width.
+  `Fill(1)` divides the remaining body between the rows of cards. `Vertical` is
+  one card per row; the grid layouts use a small `equal_spans` helper so every
+  card has the same size. `card_rects` walks the configured card order and drops
+  any rows that do not fit, which keeps rendering and hit areas consistent.
 - **`Block`, `Gauge`, `Paragraph`**: rounded bordered cards, one-line gauges,
   and styled `Line`/`Span` content. The layout uses only built-in widgets, which
   makes the rendering easy to follow.
@@ -387,13 +416,15 @@ profiles. Making that action non-blocking is listed as a future improvement.
 - Linux-only; the sysfs/procfs paths are intentionally not portable.
 - The interface is tuned for at least 72×22 and looks best at 80×30 or larger
   in the default `Vertical` layout; the grid layouts fit shorter terminals.
-  Cards clip gracefully below that; at very small sizes the screen shows a
-  one-line size hint.
+  Cards that cannot fit are omitted rather than clipped; at very small sizes the
+  screen shows a one-line size hint.
 - Battery power draw depends on firmware. Many laptops report `0` while on AC,
   not charging, or under a charge threshold, in which case `niraboard` shows
   `—`.
 - UPower is only used as a fallback when no sysfs battery is found. It is not
   polled for additional statistics while sysfs works.
+- The disk card reports `/` only. Other mounted filesystems, per-partition
+  details, and I/O throughput are not shown.
 - `powerprofilesctl set` briefly blocks the event loop (about 0.5 s on this
   machine). Profile *reads* use the cheap D-Bus path when `busctl` exists.
 - Wi-Fi signal is NetworkManager's percentage and the link rate is the cached
