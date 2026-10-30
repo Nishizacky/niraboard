@@ -1,0 +1,20 @@
+[package]
+name = "niraboard"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A compact laptop power dashboard for the terminal"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+strip = true

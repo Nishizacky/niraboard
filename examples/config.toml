@@ -1,0 +1,27 @@
+# niraboard configuration
+#
+# Copy this file to:
+#   $XDG_CONFIG_HOME/niraboard/config.toml
+#   (~/.config/niraboard/config.toml when XDG_CONFIG_HOME is unset)
+#
+# A missing file is fine; every setting below shows its default value.
+
+# Card layout used at startup: "vertical", "horizontal",
+# "2-columns", or "3-columns".
+layout = "vertical"
+
+[colors]
+# Accent used for the header, focused borders, buttons, and key hints.
+# Accepts colour names (cyan, light-blue, ...), an ANSI index (0-255),
+# or a hexadecimal value such as "#4fc3f7".
+main = "cyan"
+
+# Normal fill colour of gauges. Warning and critical states stay
+# yellow/red.
+bar = "green"
+
+[steps]
+# Percentage changed by one brightness / volume adjustment.
+# Valid values are 1-100.
+brightness = 5
+volume = 5

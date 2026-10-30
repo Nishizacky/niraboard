@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=niraboard
+GenericName=Laptop Power Dashboard
+Comment=Compact laptop power dashboard for the terminal
+Exec=niraboard
+Icon=utilities-system-monitor
+Terminal=true
+Categories=System;Monitor;
+Keywords=laptop;battery;power;profile;cpu;memory;wifi;network;ip;dashboard;tui;
+StartupNotify=false
