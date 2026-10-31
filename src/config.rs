@@ -20,6 +20,7 @@ const DEFAULT_BAD_COLOR: Color = Color::Red;
 const DEFAULT_STEP: u8 = 5;
 const MIN_STEP: u8 = 1;
 const MAX_STEP: u8 = 100;
+const DEFAULT_CLOCK_FORMAT: &str = "%Y-%m-%d %H:%M";
 
 /// Colours used by the dashboard.
 ///
@@ -79,12 +80,30 @@ impl Steps {
     }
 }
 
+/// Clock and date shown in the header, to the left of the title.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClockConfig {
+    pub enabled: bool,
+    /// strftime-style format used for the current local time.
+    pub format: String,
+}
+
+impl Default for ClockConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            format: DEFAULT_CLOCK_FORMAT.to_owned(),
+        }
+    }
+}
+
 /// User configuration loaded from `config.toml`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub colors: Colors,
     pub layout: LayoutMode,
     pub steps: Steps,
+    pub clock: ClockConfig,
     /// Cards in display order. Cards that do not fit on screen are not drawn.
     pub cards: Vec<Card>,
 }
@@ -95,6 +114,7 @@ impl Default for Config {
             colors: Colors::default(),
             layout: LayoutMode::default(),
             steps: Steps::default(),
+            clock: ClockConfig::default(),
             cards: Card::ALL.to_vec(),
         }
     }
@@ -166,6 +186,13 @@ impl Config {
             config.steps.volume = parse_step(value, "steps.volume")?;
         }
 
+        if let Some(enabled) = raw.clock.enabled {
+            config.clock.enabled = enabled;
+        }
+        if let Some(format) = raw.clock.format {
+            config.clock.format = parse_clock_format(&format)?;
+        }
+
         if let Some(cards) = raw.cards {
             config.cards = parse_cards(&cards)?;
         }
@@ -216,6 +243,14 @@ fn parse_step(value: u8, key: &str) -> Result<u8> {
     Ok(value)
 }
 
+fn parse_clock_format(value: &str) -> Result<String> {
+    if value.contains(['\n', '\r']) {
+        bail!("clock.format must be a single line");
+    }
+
+    Ok(value.to_owned())
+}
+
 fn parse_cards(names: &[String]) -> Result<Vec<Card>> {
     let mut cards = Vec::with_capacity(names.len());
 
@@ -238,6 +273,8 @@ fn parse_cards(names: &[String]) -> Result<Vec<Card>> {
 struct RawConfig {
     layout: Option<String>,
     cards: Option<Vec<String>>,
+    #[serde(default)]
+    clock: RawClock,
     #[serde(default)]
     colors: RawColors,
     #[serde(default)]
@@ -268,6 +305,10 @@ impl From<&Config> for RawConfig {
                 brightness: Some(config.steps.brightness),
                 volume: Some(config.steps.volume),
             },
+            clock: RawClock {
+                enabled: Some(config.clock.enabled),
+                format: Some(config.clock.format.clone()),
+            },
         }
     }
 }
@@ -289,6 +330,13 @@ struct RawColors {
 struct RawSteps {
     brightness: Option<u8>,
     volume: Option<u8>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RawClock {
+    enabled: Option<bool>,
+    format: Option<String>,
 }
 
 #[cfg(test)]
@@ -393,6 +441,37 @@ mod tests {
         let config = Config::parse(r#"cards = ["audio", "cpu", "battery"]"#).expect("valid cards");
 
         assert_eq!(config.cards, vec![Card::Audio, Card::Cpu, Card::Battery]);
+    }
+
+    #[test]
+    fn parses_clock_settings() {
+        let config = Config::parse(
+            r#"
+                [clock]
+                enabled = false
+                format = "%H:%M"
+            "#,
+        )
+        .expect("valid clock");
+
+        assert!(!config.clock.enabled);
+        assert_eq!(config.clock.format, "%H:%M");
+    }
+
+    #[test]
+    fn defaults_to_an_enabled_clock() {
+        let config = Config::parse("").expect("empty config");
+
+        assert!(config.clock.enabled);
+        assert_eq!(config.clock.format, "%Y-%m-%d %H:%M");
+    }
+
+    #[test]
+    fn rejects_multiline_clock_format() {
+        let error =
+            Config::parse("[clock]\nformat = \"a\\nb\"").expect_err("multiline clock format");
+
+        assert!(format!("{error:#}").contains("clock.format"));
     }
 
     #[test]

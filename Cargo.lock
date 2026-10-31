@@ -674,6 +674,7 @@ dependencies = [
  "ratatui",
  "rustix",
  "serde",
+ "time",
  "toml",
 ]
 

@@ -1,11 +1,14 @@
+use std::time::Instant;
+
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Gauge, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Gauge, Paragraph};
 
 use crate::app::{App, Card, Focus, LayoutMode, StatusLevel};
 use crate::config::{Colors, Steps};
+use crate::notifications::{Entry, Tab};
 use crate::system::{Battery, ChargeState, PowerProfile};
 
 /// Smallest terminal width that keeps the header, footer, and a single card
@@ -33,6 +36,9 @@ pub struct HitAreas {
     mute: Option<Rect>,
     layout: Option<Rect>,
     wifi: Option<Rect>,
+    notification_button: Option<Rect>,
+    notification_tabs: Vec<(Rect, Tab)>,
+    notification_window: Option<Rect>,
     steps: Steps,
 }
 
@@ -45,12 +51,24 @@ pub enum ClickAction {
     ToggleMute,
     CycleLayout,
     OpenNetwork,
+    ToggleNotifications,
+    SelectNotificationTab(Tab),
 }
 
 impl HitAreas {
     pub fn action_at(&self, x: u16, y: u16) -> Option<ClickAction> {
         let position = Position::new(x, y);
 
+        if contains(self.notification_button, position) {
+            return Some(ClickAction::ToggleNotifications);
+        }
+        if let Some((_, tab)) = self
+            .notification_tabs
+            .iter()
+            .find(|(rect, _)| rect.contains(position))
+        {
+            return Some(ClickAction::SelectNotificationTab(*tab));
+        }
         if contains(self.layout, position) {
             return Some(ClickAction::CycleLayout);
         }
@@ -84,6 +102,11 @@ impl HitAreas {
                     .map(|(_, focus)| ClickAction::Focus(*focus))
             })
     }
+
+    /// Rectangle occupied by the notification overlay, when it is open.
+    pub fn notification_window(&self) -> Option<Rect> {
+        self.notification_window
+    }
 }
 
 fn contains(rect: Option<Rect>, position: Position) -> bool {
@@ -115,7 +138,11 @@ pub fn draw(frame: &mut Frame, app: &App) -> HitAreas {
     draw_header(frame, header, app, &mut hits, colors);
 
     draw_body(frame, body, app, &mut hits, colors);
-    draw_footer(frame, footer, app, colors);
+    draw_footer(frame, footer, app, &mut hits, colors);
+
+    if app.notifications.is_open() {
+        draw_notifications(frame, area, app, &mut hits, colors);
+    }
 
     if app.show_quit_confirmation {
         draw_quit_confirmation(frame, area, colors);
@@ -288,23 +315,36 @@ fn equal_spans(start: u16, total: u16, count: usize, gap: u16) -> Vec<(u16, u16)
 fn draw_header(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitAreas, colors: Colors) {
     let columns = Layout::horizontal([Constraint::Fill(1), Constraint::Length(22)]).split(area);
 
-    let title = Line::from(vec![
-        Span::styled(
-            " NIRABOARD ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(colors.main)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-        Span::styled(
-            app.identity.as_str(),
-            Style::default()
-                .fg(colors.text)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]);
-    frame.render_widget(Paragraph::new(title), columns[0]);
+    let badge_width = " NIRABOARD ".chars().count();
+    let mut title = Vec::with_capacity(4);
+
+    // Keep the clock to the left of the badge, but never let a long format or
+    // a narrow terminal push the title off screen.
+    if let Some(clock) = app.clock_text() {
+        let clock_width = clock.chars().count() + 2;
+        if clock_width.saturating_add(badge_width).saturating_add(2) <= columns[0].width as usize {
+            title.push(Span::styled(
+                format!(" {clock} "),
+                Style::default().fg(colors.text),
+            ));
+        }
+    }
+
+    title.push(Span::styled(
+        " NIRABOARD ",
+        Style::default()
+            .fg(Color::Black)
+            .bg(colors.main)
+            .add_modifier(Modifier::BOLD),
+    ));
+    title.push(Span::raw(" "));
+    title.push(Span::styled(
+        app.identity.as_str(),
+        Style::default()
+            .fg(colors.text)
+            .add_modifier(Modifier::BOLD),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(title)), columns[0]);
 
     let right = Paragraph::new(Line::from(vec![
         Span::styled(
@@ -320,8 +360,9 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitAreas, co
     frame.render_widget(right, columns[1]);
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect, app: &App, colors: Colors) {
+fn draw_footer(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitAreas, colors: Colors) {
     let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(area);
+    let columns = Layout::horizontal([Constraint::Fill(1), Constraint::Length(23)]).split(rows[0]);
 
     let help = Line::from(vec![
         key("tab", colors),
@@ -343,11 +384,44 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, colors: Colors) {
     ]);
     frame.render_widget(
         Paragraph::new(help).style(Style::default().fg(colors.muted)),
-        rows[0],
+        columns[0],
     );
+
+    let unread = app.notifications.unread();
+    let (label, style) = if app.notifications.is_open() {
+        (
+            "[n] close".to_owned(),
+            Style::default()
+                .fg(colors.main)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if unread > 0 {
+        let count = if unread > 99 {
+            "99+".to_owned()
+        } else {
+            unread.to_string()
+        };
+        (
+            format!("[n] notifications ({count})"),
+            Style::default()
+                .fg(colors.main)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (
+            "[n] notifications".to_owned(),
+            Style::default().fg(colors.muted),
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(label, style))).alignment(Alignment::Right),
+        columns[1],
+    );
+    hits.notification_button = Some(columns[1]);
 
     let (text, color) = match app.status_text() {
         Some((text, StatusLevel::Info)) => (text, colors.ok),
+        Some((text, StatusLevel::Warn)) => (text, colors.warn),
         Some((text, StatusLevel::Error)) => (text, colors.bad),
         None => ("ready · click cards or buttons", colors.muted),
     };
@@ -1017,6 +1091,191 @@ fn draw_too_small(frame: &mut Frame, area: Rect, width: u16, height: u16, colors
     );
 }
 
+fn draw_notifications(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    hits: &mut HitAreas,
+    colors: Colors,
+) {
+    if area.is_empty() {
+        return;
+    }
+
+    let width = area.width.saturating_sub(4).clamp(40, 78).min(area.width);
+    let height = area.height.saturating_sub(4).clamp(9, 22).min(area.height);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+
+    hits.notification_window = Some(popup);
+    frame.render_widget(Clear, popup);
+
+    let center = &app.notifications;
+    let total = center.filtered_count();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(colors.main))
+        .title(Span::styled(
+            format!(" Notifications · {total} "),
+            Style::default()
+                .fg(colors.main)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    if inner.height < 3 {
+        return;
+    }
+
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Fill(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+
+    draw_notification_tabs(frame, rows[0], app, hits, colors);
+
+    let list_area = rows[1];
+    let filtered: Vec<&Entry> = center.filtered().collect();
+    let visible = list_area.height as usize;
+
+    if filtered.is_empty() {
+        let message = if total == 0 {
+            "No notifications yet"
+        } else {
+            "No notifications in this tab"
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                message,
+                Style::default().fg(colors.muted),
+            )))
+            .alignment(Alignment::Center),
+            list_area,
+        );
+    } else {
+        let start = center.offset().min(filtered.len().saturating_sub(1));
+        let now = Instant::now();
+        let lines: Vec<Line> = filtered
+            .iter()
+            .skip(start)
+            .take(visible)
+            .map(|entry| {
+                let age = entry.age_label(now);
+                let (marker, color) = match entry.level {
+                    StatusLevel::Info => ("●", colors.ok),
+                    StatusLevel::Warn => ("!", colors.warn),
+                    StatusLevel::Error => ("✕", colors.bad),
+                };
+                let body = fit(&entry.text, list_area.width.saturating_sub(8));
+                Line::from(vec![
+                    Span::styled(format!("{age:>4}"), Style::default().fg(colors.muted)),
+                    Span::raw("  "),
+                    Span::styled(
+                        marker,
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(body, Style::default().fg(colors.text)),
+                ])
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(lines), list_area);
+    }
+
+    draw_notification_hint(frame, rows[2], &filtered, center.offset(), visible, colors);
+}
+
+fn draw_notification_tabs(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    hits: &mut HitAreas,
+    colors: Colors,
+) {
+    if area.is_empty() {
+        return;
+    }
+
+    let mut x = area.x;
+
+    for tab in Tab::ALL {
+        let label = format!(" {} ", tab.label());
+        let width = label.chars().count() as u16;
+        if x.saturating_add(width) > area.right() {
+            break;
+        }
+
+        let rect = Rect::new(x, area.y, width, 1);
+        let style = if app.notifications.tab() == tab {
+            Style::default()
+                .fg(Color::Black)
+                .bg(colors.main)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(colors.muted)
+        };
+        frame.render_widget(Paragraph::new(Line::from(Span::styled(label, style))), rect);
+        hits.notification_tabs.push((rect, tab));
+        x = x.saturating_add(width).saturating_add(1);
+    }
+}
+
+fn draw_notification_hint(
+    frame: &mut Frame,
+    area: Rect,
+    filtered: &[&Entry],
+    offset: usize,
+    visible: usize,
+    colors: Colors,
+) {
+    if area.is_empty() {
+        return;
+    }
+
+    let hint = Line::from(vec![
+        key("tab", colors),
+        Span::raw(" switch  "),
+        key("j/k", colors),
+        Span::raw(" scroll  "),
+        key("n/Esc", colors),
+        Span::raw(" close"),
+    ]);
+
+    let start = offset.min(filtered.len().saturating_sub(1));
+    let position = if filtered.is_empty() {
+        "0 / 0".to_owned()
+    } else {
+        let shown = visible.min(filtered.len() - start);
+        format!("{}-{} / {}", start + 1, start + shown, filtered.len())
+    };
+    let columns = Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Length(position.chars().count() as u16),
+    ])
+    .split(area);
+
+    frame.render_widget(
+        Paragraph::new(hint).style(Style::default().fg(colors.muted)),
+        columns[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            position,
+            Style::default().fg(colors.muted),
+        )))
+        .alignment(Alignment::Right),
+        columns[1],
+    );
+}
+
 fn draw_quit_confirmation(frame: &mut Frame, area: Rect, colors: Colors) {
     let [_, middle, _] = Layout::vertical([
         Constraint::Fill(1),
@@ -1133,6 +1392,7 @@ fn fit(text: &str, width: u16) -> String {
 mod tests {
     use super::*;
     use crate::app::App;
+    use crate::notifications::{Source, Tab};
     use crate::system::{Audio, Battery, Brightness, ChargeState, Disk};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -1155,12 +1415,16 @@ mod tests {
         app.layout = layout;
         app.config.cards = cards;
 
+        render_app(&app, width, height)
+    }
+
+    fn render_app(app: &App, width: u16, height: u16) -> (String, HitAreas) {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let mut hits = HitAreas::default();
         terminal
             .draw(|frame| {
-                hits = draw(frame, &app);
+                hits = draw(frame, app);
             })
             .expect("draw");
 
@@ -1404,6 +1668,126 @@ mod tests {
             hits.action_at(rect.x, rect.y),
             Some(ClickAction::CycleLayout)
         );
+    }
+
+    #[test]
+    fn footer_notification_button_is_clickable() {
+        let (_, hits) = render_layout(120, 60, LayoutMode::Vertical);
+        let rect = hits.notification_button.expect("notification button");
+
+        assert_eq!(
+            hits.action_at(rect.x, rect.y),
+            Some(ClickAction::ToggleNotifications)
+        );
+    }
+
+    #[test]
+    fn renders_notification_window_with_tabs_and_entries() {
+        let mut app = test_app();
+        app.notifications.push(
+            "Battery low: 24%".to_owned(),
+            StatusLevel::Warn,
+            Source::System,
+            "battery-low",
+        );
+        app.notifications.push(
+            "Power profile: balanced".to_owned(),
+            StatusLevel::Info,
+            Source::Control,
+            "power-profile",
+        );
+        app.notifications.toggle();
+
+        let (screen, hits) = render_app(&app, 120, 60);
+
+        for label in [
+            "Notifications",
+            "All",
+            "System",
+            "Controls",
+            "Issues",
+            "Battery low: 24%",
+            "Power profile: balanced",
+            "n/Esc",
+        ] {
+            assert!(screen.contains(label), "missing {label} in\n{screen}");
+        }
+
+        assert!(hits.notification_window.is_some());
+        assert_eq!(hits.notification_tabs.len(), Tab::ALL.len());
+    }
+
+    #[test]
+    fn notification_tabs_are_clickable() {
+        let mut app = test_app();
+        app.notifications.push(
+            "Battery low: 24%".to_owned(),
+            StatusLevel::Warn,
+            Source::System,
+            "battery-low",
+        );
+        app.notifications.toggle();
+
+        let (_, hits) = render_app(&app, 120, 60);
+        let (rect, tab) = hits
+            .notification_tabs
+            .iter()
+            .find(|(_, tab)| *tab == Tab::System)
+            .copied()
+            .expect("system tab");
+
+        assert_eq!(
+            hits.action_at(rect.x, rect.y),
+            Some(ClickAction::SelectNotificationTab(tab))
+        );
+    }
+
+    #[test]
+    fn empty_notification_window_shows_a_hint() {
+        let mut app = test_app();
+        app.notifications.toggle();
+
+        let (screen, _) = render_app(&app, 120, 60);
+        assert!(screen.contains("No notifications yet"));
+    }
+
+    #[test]
+    fn header_clock_appears_left_of_the_title() {
+        let mut app = test_app();
+        app.config.clock.format = "CLOCK".to_owned();
+        assert!(app.update_clock());
+
+        let (screen, _) = render_app(&app, 120, 60);
+        let header = screen.lines().next().expect("header");
+        let clock = header.find("CLOCK").expect("clock in header");
+        let title = header.find("NIRABOARD").expect("title in header");
+
+        assert!(clock < title, "clock should be left of the title: {header}");
+    }
+
+    #[test]
+    fn header_clock_can_be_disabled() {
+        let mut app = test_app();
+        app.config.clock.enabled = false;
+        app.config.clock.format = "CLOCK".to_owned();
+        assert!(!app.update_clock());
+
+        let (screen, _) = render_app(&app, 120, 60);
+
+        assert!(!screen.contains("CLOCK"));
+    }
+
+    #[test]
+    fn header_clock_is_omitted_when_it_would_hide_the_title() {
+        let mut app = test_app();
+        app.config.clock.format = "CLOCK".repeat(20);
+        assert!(app.update_clock());
+
+        let (screen, _) = render_app(&app, 72, 43);
+        let header = screen.lines().next().expect("header");
+
+        assert!(!header.contains("CLOCK"));
+        assert!(header.contains("NIRABOARD"));
     }
 
     #[test]

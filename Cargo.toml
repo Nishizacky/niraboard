@@ -2,6 +2,7 @@
 name = "niraboard"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 description = "A compact laptop power dashboard for the terminal"
 license = "MIT"
 
@@ -10,6 +11,7 @@ anyhow = "1.0"
 ratatui = "0.30.2"
 rustix = { version = "1", features = ["fs"] }
 serde = { version = "1.0", features = ["derive"] }
+time = { version = "0.3", features = ["local-offset"] }
 toml = "0.8"
 
 [profile.dev.package."*"]

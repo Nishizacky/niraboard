@@ -25,6 +25,18 @@ cards = [
     "audio",
 ]
 
+[clock]
+# Show the clock and date in the header, left of the NIRABOARD title.
+enabled = true
+
+# strftime-style format for the current local time. Common specifiers:
+# %Y year, %m month, %d day, %e space-padded day,
+# %H hour (24h), %I hour (12h), %M minute, %S second, %p AM/PM,
+# %a / %A short / full weekday, %b / %B short / full month,
+# %F date (%Y-%m-%d), %T time (%H:%M:%S), %R time (%H:%M),
+# %z UTC offset, %% literal percent sign.
+format = "%Y-%m-%d %H:%M"
+
 [colors]
 # Accent used for the header, focused borders, buttons, and key hints.
 # Accepts colour names (cyan, light-blue, ...), an ANSI index (0-255),

@@ -4,11 +4,14 @@ use anyhow::Error;
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use ratatui::layout::Position;
 
 use crate::actions;
 use crate::config::Config;
 use crate::event::Event;
-use crate::system::{Monitor, PowerProfile, identity};
+pub use crate::notifications::Level as StatusLevel;
+use crate::notifications::{Center, Source};
+use crate::system::{Metrics, Monitor, PowerProfile, identity};
 use crate::ui::{ClickAction, HitAreas};
 
 const STATUS_TTL: Duration = Duration::from_secs(5);
@@ -157,12 +160,6 @@ impl LayoutMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StatusLevel {
-    Info,
-    Error,
-}
-
 #[derive(Debug)]
 pub struct StatusMessage {
     pub text: String,
@@ -194,6 +191,8 @@ pub struct App {
     pub should_quit: bool,
     pub show_quit_confirmation: bool,
     pub identity: String,
+    pub notifications: Center,
+    clock_text: String,
     network_requested: bool,
 }
 
@@ -209,6 +208,12 @@ impl App {
     }
 
     pub fn with_config(config: Config) -> Self {
+        let clock_text = if config.clock.enabled {
+            crate::clock::now(&config.clock.format)
+        } else {
+            String::new()
+        };
+
         Self {
             monitor: Monitor::new(),
             focus: Focus::Power,
@@ -219,17 +224,48 @@ impl App {
             should_quit: false,
             show_quit_confirmation: false,
             identity: identity(),
+            notifications: Center::default(),
+            clock_text,
             network_requested: false,
         }
     }
 
+    /// Refresh the header clock. Returns true when the rendered text changed.
+    ///
+    /// Called more often than [`App::tick`] so formats that include seconds stay
+    /// accurate without refreshing every system metric once per second.
+    pub fn update_clock(&mut self) -> bool {
+        if !self.config.clock.enabled {
+            return false;
+        }
+
+        let text = crate::clock::now(&self.config.clock.format);
+        if text == self.clock_text {
+            return false;
+        }
+
+        self.clock_text = text;
+        true
+    }
+
+    /// Clock and date text for the header, or `None` when it is hidden.
+    pub fn clock_text(&self) -> Option<&str> {
+        if !self.config.clock.enabled || self.clock_text.is_empty() {
+            return None;
+        }
+
+        Some(self.clock_text.as_str())
+    }
+
     /// Show a configuration problem in the footer without aborting startup.
     pub fn report_config_warning(&mut self, error: Error) {
-        self.set_error("Config", error);
+        self.set_error("Config", error, Source::System, "config-error");
     }
 
     pub fn refresh_all(&mut self) -> bool {
-        self.monitor.refresh_all()
+        let before = self.monitor.metrics.clone();
+        let changed = self.monitor.refresh_all();
+        changed | self.detect_changes(&before)
     }
 
     /// Take a pending request to launch the interactive network editor.
@@ -240,18 +276,121 @@ impl App {
     /// Report the result of the interactive network editor to the status bar.
     pub fn network_settings_finished(&mut self, result: anyhow::Result<()>) {
         match result {
-            Ok(()) => self.set_status("Network settings closed".to_owned(), StatusLevel::Info),
-            Err(error) => self.set_error("Network settings", error),
+            Ok(()) => self.set_status(
+                "Network settings closed".to_owned(),
+                StatusLevel::Info,
+                Source::Control,
+                "network-settings",
+            ),
+            Err(error) => self.set_error(
+                "Network settings",
+                error,
+                Source::Control,
+                "network-settings-error",
+            ),
         }
     }
 
     /// Called once per tick. Returns true when a redraw is needed.
     pub fn tick(&mut self) -> bool {
+        let before = self.monitor.metrics.clone();
         let mut changed = self.monitor.tick();
+        changed |= self.detect_changes(&before);
 
         if self.status.as_ref().is_some_and(StatusMessage::is_expired) {
             self.status = None;
             changed = true;
+        }
+
+        // Relative notification timestamps need a fresh frame even when no
+        // metric changed.
+        if self.notifications.is_open() {
+            changed = true;
+        }
+
+        changed
+    }
+
+    /// Turn transitions in the metrics snapshot into notifications. Only
+    /// crossing a threshold or changing state logs an entry, so a low battery
+    /// or a hot CPU does not repeat every tick.
+    fn detect_changes(&mut self, before: &Metrics) -> bool {
+        let mut events: Vec<(String, StatusLevel, Source, &'static str)> = Vec::new();
+        let after = &self.monitor.metrics;
+
+        if let (Some(previous), Some(current)) = (&before.battery, &after.battery) {
+            if previous.ac_online != current.ac_online {
+                let (text, group) = if current.ac_online {
+                    ("AC connected", "ac-connected")
+                } else {
+                    ("Running on battery", "ac-disconnected")
+                };
+                events.push((text.to_owned(), StatusLevel::Info, Source::System, group));
+            }
+
+            if current.percent <= 10 && previous.percent > 10 {
+                events.push((
+                    format!("Battery critical: {}%", current.percent),
+                    StatusLevel::Error,
+                    Source::System,
+                    "battery-critical",
+                ));
+            } else if current.percent <= 25 && previous.percent > 25 {
+                events.push((
+                    format!("Battery low: {}%", current.percent),
+                    StatusLevel::Warn,
+                    Source::System,
+                    "battery-low",
+                ));
+            }
+        }
+
+        let wifi_change = match (&before.wifi, &after.wifi) {
+            (Some(previous), Some(current)) if previous.connected != current.connected => {
+                Some(current)
+            }
+            _ => None,
+        };
+        if let Some(current) = wifi_change {
+            if current.connected {
+                let ssid = current
+                    .ssid
+                    .as_deref()
+                    .filter(|ssid| !ssid.is_empty())
+                    .map(|ssid| format!(": {ssid}"))
+                    .unwrap_or_default();
+                events.push((
+                    format!("Wi-Fi connected{ssid}"),
+                    StatusLevel::Info,
+                    Source::System,
+                    "wifi-connected",
+                ));
+            } else {
+                events.push((
+                    "Wi-Fi disconnected".to_owned(),
+                    StatusLevel::Warn,
+                    Source::System,
+                    "wifi-disconnected",
+                ));
+            }
+        }
+
+        let hot_cpu = match (before.cpu.temp_c, after.cpu.temp_c) {
+            (Some(previous), Some(current)) if previous < 85.0 && current >= 85.0 => Some(current),
+            _ => None,
+        };
+        if let Some(current) = hot_cpu {
+            events.push((
+                format!("CPU hot: {current:.1} °C"),
+                StatusLevel::Warn,
+                Source::System,
+                "cpu-hot",
+            ));
+        }
+
+        let changed = !events.is_empty();
+        for (text, level, source, group) in events {
+            self.notifications.push(text, level, source, group);
         }
 
         changed
@@ -283,14 +422,16 @@ impl App {
             return true;
         }
 
+        if self.notifications.is_open() {
+            return self.handle_notification_key(key);
+        }
+
         match key.code {
             KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
                 self.show_quit_confirmation = true;
                 true
             }
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('n') | KeyCode::Char('N') => {
-                true
-            }
+            KeyCode::Char('y') | KeyCode::Char('Y') => true,
             KeyCode::Tab => {
                 self.focus = self.focus.next();
                 true
@@ -311,6 +452,7 @@ impl App {
                 self.toggle_mute();
                 true
             }
+            KeyCode::Char('n') | KeyCode::Char('N') => self.toggle_notifications(),
             KeyCode::Char('v') | KeyCode::Char('V') => {
                 self.cycle_layout();
                 true
@@ -321,7 +463,12 @@ impl App {
             }
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 let _ = self.refresh_all();
-                self.set_status("Refreshed".to_owned(), StatusLevel::Info);
+                self.set_status(
+                    "Refreshed".to_owned(),
+                    StatusLevel::Info,
+                    Source::Control,
+                    "refresh",
+                );
                 true
             }
             KeyCode::Char('1') => {
@@ -340,6 +487,59 @@ impl App {
         }
     }
 
+    /// Keys owned by the open notification window. Everything else is ignored
+    /// so dashboard shortcuts cannot fire behind the overlay.
+    fn handle_notification_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.notifications.close();
+                true
+            }
+            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('L') => {
+                self.notifications.next_tab();
+                true
+            }
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('H') => {
+                self.notifications.previous_tab();
+                true
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
+                self.notifications.scroll_by(1);
+                true
+            }
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
+                self.notifications.scroll_by(-1);
+                true
+            }
+            KeyCode::PageDown => {
+                self.notifications.scroll_by(5);
+                true
+            }
+            KeyCode::PageUp => {
+                self.notifications.scroll_by(-5);
+                true
+            }
+            KeyCode::Home => {
+                self.notifications.scroll_to_start();
+                true
+            }
+            KeyCode::End => {
+                self.notifications.scroll_to_end();
+                true
+            }
+            KeyCode::Char('q') | KeyCode::Char('Q') => {
+                self.show_quit_confirmation = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn toggle_notifications(&mut self) -> bool {
+        self.notifications.toggle();
+        true
+    }
+
     fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
         if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
             return false;
@@ -349,7 +549,34 @@ impl App {
             return self.confirm_quit(false);
         }
 
-        let Some(action) = self.hits.action_at(mouse.column, mouse.row) else {
+        let position = Position::new(mouse.column, mouse.row);
+        let action = self.hits.action_at(mouse.column, mouse.row);
+
+        if let Some(ClickAction::ToggleNotifications) = action {
+            return self.toggle_notifications();
+        }
+
+        if self.notifications.is_open() {
+            if let Some(ClickAction::SelectNotificationTab(tab)) = action {
+                self.notifications.select_tab(tab);
+                return true;
+            }
+
+            // A click inside the panel is consumed; a click outside closes it
+            // without activating whatever card was underneath.
+            let inside = self
+                .hits
+                .notification_window()
+                .is_some_and(|rect| rect.contains(position));
+            if inside {
+                return false;
+            }
+
+            self.notifications.close();
+            return true;
+        }
+
+        let Some(action) = action else {
             return false;
         };
 
@@ -386,6 +613,8 @@ impl App {
                 self.network_requested = true;
                 true
             }
+            ClickAction::ToggleNotifications => self.toggle_notifications(),
+            ClickAction::SelectNotificationTab(_) => false,
         }
     }
 
@@ -394,6 +623,8 @@ impl App {
         self.set_status(
             format!("Layout: {}", self.layout.label()),
             StatusLevel::Info,
+            Source::Control,
+            "layout",
         );
     }
 
@@ -426,8 +657,15 @@ impl App {
             Ok(()) => self.set_status(
                 format!("Power profile: {}", profile.label()),
                 StatusLevel::Info,
+                Source::Control,
+                "power-profile",
             ),
-            Err(error) => self.set_error("Power profile", error),
+            Err(error) => self.set_error(
+                "Power profile",
+                error,
+                Source::Control,
+                "power-profile-error",
+            ),
         }
     }
 
@@ -446,9 +684,14 @@ impl App {
                     .as_ref()
                     .map(|brightness| format!("{}%", brightness.percent))
                     .unwrap_or_else(|| "updated".to_owned());
-                self.set_status(format!("Brightness: {level}"), StatusLevel::Info);
+                self.set_status(
+                    format!("Brightness: {level}"),
+                    StatusLevel::Info,
+                    Source::Control,
+                    "brightness",
+                );
             }
-            Err(error) => self.set_error("Brightness", error),
+            Err(error) => self.set_error("Brightness", error, Source::Control, "brightness-error"),
         }
     }
 
@@ -467,9 +710,9 @@ impl App {
                     Some(audio) => format!("Volume {}%", audio.volume_percent),
                     None => "Volume updated".to_owned(),
                 };
-                self.set_status(text, StatusLevel::Info);
+                self.set_status(text, StatusLevel::Info, Source::Control, "volume");
             }
-            Err(error) => self.set_error("Volume", error),
+            Err(error) => self.set_error("Volume", error, Source::Control, "volume-error"),
         }
     }
 
@@ -488,17 +731,24 @@ impl App {
                     .as_ref()
                     .is_some_and(|audio| audio.muted);
                 let text = if muted { "Muted" } else { "Unmuted" };
-                self.set_status(text.to_owned(), StatusLevel::Info);
+                self.set_status(text.to_owned(), StatusLevel::Info, Source::Control, "mute");
             }
-            Err(error) => self.set_error("Mute", error),
+            Err(error) => self.set_error("Mute", error, Source::Control, "mute-error"),
         }
     }
 
-    fn set_status(&mut self, text: String, level: StatusLevel) {
+    fn set_status(
+        &mut self,
+        text: String,
+        level: StatusLevel,
+        source: Source,
+        group: &'static str,
+    ) {
+        self.notifications.push(text.clone(), level, source, group);
         self.status = Some(StatusMessage::new(text, level));
     }
 
-    fn set_error(&mut self, context: &str, error: Error) {
+    fn set_error(&mut self, context: &str, error: Error, source: Source, group: &'static str) {
         let detail = format!("{error:#}");
         let detail = detail.lines().next().unwrap_or("action failed");
         let mut text = format!("{context}: {detail}");
@@ -508,7 +758,7 @@ impl App {
             text.push_str("...");
         }
 
-        self.set_status(text, StatusLevel::Error);
+        self.set_status(text, StatusLevel::Error, source, group);
     }
 
     /// Confirm or cancel quit when the user presses y/n during confirmation.
@@ -530,6 +780,29 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notifications::Tab;
+    use crate::system::{Battery, ChargeState, Wifi};
+
+    fn battery(percent: u8, ac_online: bool) -> Battery {
+        Battery {
+            percent,
+            state: ChargeState::Discharging,
+            power_w: None,
+            health_percent: None,
+            energy_now_wh: None,
+            energy_full_wh: None,
+            ac_online,
+        }
+    }
+
+    fn wifi(connected: bool, ssid: Option<&str>) -> Wifi {
+        Wifi {
+            connected,
+            ssid: ssid.map(str::to_owned),
+            signal: Some(80),
+            rate_mbps: None,
+        }
+    }
 
     #[test]
     fn focus_cycles_in_both_directions() {
@@ -597,5 +870,152 @@ mod tests {
         let app = App::with_config(config);
 
         assert_eq!(app.layout, LayoutMode::TwoColumns);
+    }
+
+    #[test]
+    fn clock_text_uses_the_configured_format() {
+        let config = Config {
+            clock: crate::config::ClockConfig {
+                enabled: true,
+                format: "fixed".to_owned(),
+            },
+            ..Config::default()
+        };
+        let mut app = App::with_config(config);
+
+        assert_eq!(app.clock_text(), Some("fixed"));
+        assert!(!app.update_clock());
+    }
+
+    #[test]
+    fn disabled_clock_has_no_text_and_does_not_redraw() {
+        let config = Config {
+            clock: crate::config::ClockConfig {
+                enabled: false,
+                format: "%H:%M".to_owned(),
+            },
+            ..Config::default()
+        };
+        let mut app = App::with_config(config);
+
+        assert_eq!(app.clock_text(), None);
+        assert!(!app.update_clock());
+    }
+
+    #[test]
+    fn n_key_toggles_notifications_and_esc_closes_them() {
+        let mut app = App::new();
+
+        assert!(!app.notifications.is_open());
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)));
+        assert!(app.notifications.is_open());
+
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(!app.notifications.is_open());
+        assert!(!app.show_quit_confirmation);
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn tab_switches_notification_tabs_while_open() {
+        let mut app = App::new();
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+
+        assert_eq!(app.notifications.tab(), Tab::All);
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        assert_eq!(app.notifications.tab(), Tab::System);
+        assert!(app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)));
+        assert_eq!(app.notifications.tab(), Tab::All);
+    }
+
+    #[test]
+    fn status_changes_are_recorded_in_the_history() {
+        let mut app = App::new();
+
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE)));
+
+        let newest = app
+            .notifications
+            .filtered()
+            .next()
+            .expect("notification entry");
+        assert_eq!(newest.text, "Layout: Horizontal");
+        assert_eq!(newest.level, StatusLevel::Info);
+        assert_eq!(newest.source, Source::Control);
+        assert_eq!(
+            app.status_text(),
+            Some(("Layout: Horizontal", StatusLevel::Info))
+        );
+    }
+
+    #[test]
+    fn battery_low_is_reported_once_per_crossing() {
+        let mut app = App::new();
+        app.monitor.metrics.battery = Some(battery(30, false));
+        let before = app.monitor.metrics.clone();
+        app.monitor.metrics.battery = Some(battery(24, false));
+
+        assert!(app.detect_changes(&before));
+        let newest = app
+            .notifications
+            .filtered()
+            .next()
+            .expect("notification entry");
+        assert_eq!(newest.text, "Battery low: 24%");
+        assert_eq!(newest.level, StatusLevel::Warn);
+
+        let before = app.monitor.metrics.clone();
+        assert!(!app.detect_changes(&before));
+    }
+
+    #[test]
+    fn critical_battery_and_ac_changes_are_reported() {
+        let mut app = App::new();
+        app.monitor.metrics.battery = Some(battery(12, false));
+        let before = app.monitor.metrics.clone();
+        app.monitor.metrics.battery = Some(battery(9, true));
+
+        assert!(app.detect_changes(&before));
+        let texts: Vec<&str> = app
+            .notifications
+            .filtered()
+            .map(|entry| entry.text.as_str())
+            .collect();
+        assert!(texts.contains(&"AC connected"));
+        assert!(texts.contains(&"Battery critical: 9%"));
+    }
+
+    #[test]
+    fn wifi_disconnect_and_cpu_heat_are_reported() {
+        let mut app = App::new();
+        app.monitor.metrics.wifi = Some(wifi(false, None));
+        let mut before = app.monitor.metrics.clone();
+        before.wifi = Some(wifi(true, Some("home")));
+        before.cpu.temp_c = Some(70.0);
+        app.monitor.metrics.cpu.temp_c = Some(86.5);
+
+        assert!(app.detect_changes(&before));
+        let texts: Vec<&str> = app
+            .notifications
+            .filtered()
+            .map(|entry| entry.text.as_str())
+            .collect();
+        assert!(texts.contains(&"Wi-Fi disconnected"));
+        assert!(texts.contains(&"CPU hot: 86.5 °C"));
+    }
+
+    #[test]
+    fn fully_read_history_has_no_unread_badge() {
+        let mut app = App::new();
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        app.notifications.push(
+            "entry".to_owned(),
+            StatusLevel::Info,
+            Source::System,
+            "entry",
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(app.notifications.unread(), 0);
     }
 }

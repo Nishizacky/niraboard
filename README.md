@@ -6,16 +6,19 @@ A compact, keyboard-first laptop power dashboard for the terminal.
 CachyOS/Arch. It shows battery, CPU, memory, root filesystem, Wi-Fi, local and
 public IP addresses, power profile, brightness, and PipeWire volume on one
 screen, and lets you change the power profile, brightness, volume, and mute
-state without leaving the terminal. Clicking the network card (or pressing `w`)
+state without leaving the terminal. Pressing `n` opens an in-app notification
+window with a tabbed history of system transitions, actions, and failures.
+Clicking the network card (or pressing `w`)
 opens NetworkManager's `nmtui` for connection changes; the network data is
 refreshed when it exits.
 
 It is an on-demand utility: there is no daemon, no background service, and no
-polling when it is not running. Colours, the startup layout, card order, and the
-brightness/volume step sizes come from an optional TOML configuration file.
+polling when it is not running. The header clock and date, colours, the startup
+layout, card order, and the brightness/volume step sizes come from an optional
+TOML configuration file.
 
 ```text
- NIRABOARD  ThinkPad L580  ·  laptop power                    Vertical · 2s tick
+ 2026-10-31 14:05  NIRABOARD  ThinkPad L580  ·  laptop power      Vertical · 2s tick
 ╭ Battery ─────────────────────────────────────────────────────────────────────╮
 │████████████79% ██████▏                                                       │
 │ 79%  Not charging                                                            │
@@ -61,14 +64,14 @@ brightness/volume step sizes come from an optional TOML configuration file.
 │[-]         40%        [+]                                                    │
 │          [MUTE]                                                              │
 ╰──────────────────────────────────────────────────────────────────────────────╯
- tab focus  ←/→ adjust  m mute  v layout  w nmtui  1-3 profile  r refresh  q quit
+ tab focus  ←/→ adjust  m mute  v layout  w nmtui  1-3 profile  r refresh  q quit  [n] notifications
  ready · click cards or buttons
 ```
 
 ## Requirements
 
 - Linux; the sysfs/procfs paths are Linux-specific (developed on CachyOS/Arch).
-- Rust 1.85 or newer (edition 2024; the CachyOS `rust` package is current).
+- Rust 1.88 or newer (edition 2024; the CachyOS `rust` package is current).
 - `mold`, selected as the linker on Linux by `.cargo/config.toml`.
 - A true terminal for the dashboard. `--help`, `--version`, and
   `--print-default-config` work without one. In a graphical session niraboard
@@ -206,12 +209,13 @@ niraboard --print-default-config > ~/.config/niraboard/config.toml
 | `tab` / `shift+tab` | Move focus between the power, brightness, and audio cards |
 | `←` / `→` or `h` / `l` | Adjust the focused card: cycle profile, brightness, or volume by the configured step |
 | `m` | Toggle mute |
+| `n` | Open or close the notification window |
 | `v` | Cycle the card layout (see [Layouts](#layouts)) |
 | `w` | Open `nmtui` to manage Wi-Fi connections |
 | `1` / `2` / `3` | Set `power-saver`, `balanced`, or `performance` directly |
 | `r` | Refresh all data immediately |
 | `q`, `Esc`, `Ctrl-C` | Ask to quit; press `y` to confirm |
-| Mouse | Click a profile row, `[-]`, `[+]`, `[MUTE]`, a card to focus it, the network card, or the layout name in the header |
+| Mouse | Click a profile row, `[-]`, `[+]`, `[MUTE]`, a card to focus it, the network card, the layout name in the header, or the notifications button |
 
 Clicking `[-]` or `[+]` changes brightness or volume by the configured step
 (5% by default). Clicking a profile row selects it directly. Clicking anywhere
@@ -220,6 +224,31 @@ network card (or pressing `w`) temporarily leaves niraboard and opens `nmtui`;
 the network data is refreshed when it exits. Clicking the layout name in the
 top-right corner (or pressing `v`) changes the arrangement. Keyboard operation
 never depends on the mouse.
+
+While the notification window is open, `tab` / `shift+tab` or `h` / `l` switch
+tabs, `j` / `k` scroll one row, `PageUp` / `PageDown` scroll five, `Home` / `End`
+jump to the ends, and `Esc` or `n` closes it. Dashboard shortcuts are ignored
+behind the window.
+
+### Notifications
+
+`n` or the button at the right end of the footer opens a centered, tabbed
+history of what niraboard has done and seen. The button shows the number of
+unread entries; opening or closing the window marks them read.
+
+| Tab | Contents |
+| --- | --- |
+| `All` | Everything, newest first |
+| `System` | Battery, AC, Wi-Fi, and CPU temperature transitions |
+| `Controls` | Power profile, brightness, volume, mute, layout, refresh, `nmtui`, and their failures |
+| `Issues` | Warnings and errors from every source |
+
+Automatic entries are emitted only when state changes: the battery crossing
+25% or 10%, AC connecting or disconnecting, Wi-Fi connecting or disconnecting,
+and the CPU temperature crossing 85 °C. Repeating the same control within five
+seconds updates one row instead of adding another. The newest 200 entries are
+kept in memory; history is not written to disk and disappears when niraboard
+exits. Clicking a tab selects it, and clicking outside the window closes it.
 
 ### Layouts
 
@@ -295,6 +324,13 @@ cards = [
     "audio",
 ]
 
+[clock]
+# Show the clock and date in the header, left of the NIRABOARD title.
+enabled = true
+
+# strftime-style format for the current local time.
+format = "%Y-%m-%d %H:%M"
+
 [colors]
 # Accent for the header, focused borders, buttons, and key hints.
 main = "cyan"
@@ -323,6 +359,18 @@ Colours accept names (`cyan`, `light-blue`, `red`, ...), an ANSI index
 (`0`-`255`), or a hexadecimal value (`"#4fc3f7"`). Unknown keys, invalid
 colours, unknown or duplicate card names, and steps outside 1-100 are reported
 in the footer; niraboard then starts with defaults instead of exiting.
+
+The `[clock]` section controls the date and time shown to the left of the
+header title. Set `enabled = false` to hide it, or change `format` to any
+strftime-style pattern. Supported specifiers are `%Y` year, `%y` two-digit
+year, `%m` month, `%d` day, `%e` space-padded day, `%H` 24-hour, `%I`
+12-hour, `%M` minute, `%S` second, `%p` AM/PM, `%a` / `%A` short / full
+weekday, `%b` / `%B` short / full month, `%j` day of year, `%F` date,
+`%T` time, `%R` hour and minute, `%z` UTC offset, and `%%` for a literal
+percent sign. Unknown specifiers are shown unchanged, which makes typos easy to
+spot. The default `"%Y-%m-%d %H:%M"` refreshes once per minute; add `%S` for a
+live seconds display. On terminals too narrow to fit both, the clock is hidden
+so the title stays visible.
 
 `--print-default-config` prints the same defaults without the explanatory
 comments. Use `examples/config.toml` when you want a documented starting file.
@@ -388,8 +436,8 @@ changes, as recommended by power-profiles-daemon.
 
 Rendering is immediate-mode, but it is not unconditional: each refresh produces
 a typed `Metrics` snapshot, and the loop only redraws when that snapshot, the
-focus, the status message, or the terminal size changes. A 2-second tick does
-not automatically mean 2-second redraws.
+focus, the status message, the clock text, or the terminal size changes. A
+2-second tick does not automatically mean 2-second redraws.
 
 ## Architecture
 
@@ -397,9 +445,11 @@ not automatically mean 2-second redraws.
 src/
 ├── main.rs          terminal setup/restore, event/tick loop, CLI options
 ├── app.rs           application state, focus, key/mouse handling, actions
-├── config.rs        TOML loading, colours, startup layout, card order, steps
+├── clock.rs         strftime-style header clock formatting
+├── config.rs        TOML loading, colours, clock, layout, card order, steps
 ├── event.rs         crossterm event polling
 ├── actions.rs       profile/brightness/audio/nmtui command wrappers
+├── notifications.rs in-memory notification history and window state
 ├── spawn.rs         relaunches the dashboard in a terminal when needed
 ├── ui.rs            Ratatui layout, widgets, hit areas, colours
 └── system/
@@ -433,9 +483,15 @@ src/
   `App` state. Widgets are cheap values constructed per frame; there is no
   retained widget tree to synchronise.
 - **Rects and hit areas**: `ui::draw` returns `HitAreas` (card rects, profile
-  rows, button rects, and the network card). `main` stores them in `App`; mouse
-  events call `HitAreas::action_at`, which maps coordinates to a small
-  `ClickAction` enum. Rendering and input therefore share one layout definition.
+  rows, button rects, the network card, and notification targets). `main` stores
+  them in `App`; mouse events call `HitAreas::action_at`, which maps coordinates
+  to a small `ClickAction` enum. Rendering and input therefore share one layout
+  definition.
+- **Notifications**: `notifications::Center` owns the history, selected tab,
+  unread watermark, and scroll offset. `App` records explicit status messages
+  and transitions found by comparing `Metrics` snapshots; the window renders
+  that state without retaining widgets. Relative timestamps are refreshed by
+  letting the window request a redraw on every tick while it is open.
 - **Dirty redraw**: `App::tick` and `App::handle_event` return whether anything
   visible changed. `main` draws only when that flag is set. `Metrics` holds
   `Option`s for unavailable sources and derives `PartialEq`, so the same typed
@@ -483,7 +539,9 @@ profiles. Making that action non-blocking is listed as a future improvement.
   fallback because that would usually require root.
 - CPU temperature covers hwmon `coretemp`/`k10temp`/`zenpower` and common
   thermal zones. There is no `sensors` fallback yet.
-- No history graphs, battery time estimate, or low-battery notification.
+- No history graphs or battery time estimate.
+- Notifications are in-app only: desktop notification daemons such as mako,
+  dunst, or swaync are not read, and the history is not persisted across runs.
 - Terminal mouse capture can interfere with text selection unless `Shift` is
   held.
 
@@ -495,6 +553,8 @@ profiles. Making that action non-blocking is listed as a future improvement.
 - Cache the last global IP across runs so a temporarily offline machine still
   shows the previous value.
 - Sparklines for CPU, memory, and battery power history.
+- Read desktop notifications from a notification daemon and persist the
+  notification history between runs.
 - Battery time-to-empty and charge-threshold controls (with explicit policy
   checks).
 - Per-core CPU view and a compact process list.

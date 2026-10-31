@@ -1,7 +1,9 @@
 mod actions;
 mod app;
+mod clock;
 mod config;
 mod event;
+mod notifications;
 mod spawn;
 mod system;
 mod ui;
@@ -29,6 +31,9 @@ use config::Config;
 use ui::HitAreas;
 
 const TICK: Duration = Duration::from_secs(2);
+/// How often the header clock is checked for a new second. The dashboard itself
+/// still refreshes system metrics only once per [`TICK`].
+const CLOCK_REFRESH: Duration = Duration::from_secs(1);
 
 const USAGE: &str = "\
 niraboard - a compact laptop power dashboard for the terminal
@@ -194,6 +199,11 @@ fn run(session: &mut TerminalSession, config_path: Option<&Path>) -> Result<()> 
         }
 
         let timeout = TICK.saturating_sub(last_tick.elapsed());
+        let timeout = if app.config.clock.enabled {
+            timeout.min(CLOCK_REFRESH)
+        } else {
+            timeout
+        };
         if let Some(event) = event::poll(timeout)? {
             dirty |= app.handle_event(event);
         }
@@ -209,6 +219,8 @@ fn run(session: &mut TerminalSession, config_path: Option<&Path>) -> Result<()> 
             last_tick = Instant::now();
             dirty |= app.tick();
         }
+
+        dirty |= app.update_clock();
     }
 
     Ok(())
