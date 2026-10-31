@@ -2,14 +2,13 @@
 name = "niraboard"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
 description = "A compact laptop power dashboard for the terminal"
 license = "MIT"
 
 [dependencies]
 anyhow = "1.0"
-libc = "0.2"
-ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+ratatui = "0.30.2"
+rustix = { version = "1", features = ["fs"] }
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 

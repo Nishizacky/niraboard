@@ -1,4 +1,3 @@
-use std::ffi::CString;
 use std::fs;
 use std::path::Path;
 
@@ -34,33 +33,22 @@ pub fn read() -> Option<Disk> {
 
 /// Return `(total, used, available)` in bytes for the filesystem at `path`.
 fn usage(path: &Path) -> Option<(u64, u64, u64)> {
-    let path = CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
-    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-
-    // SAFETY: `stat` is a valid, writable statvfs structure and `path` is a
-    // NUL-terminated C string that outlives the call.
-    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
-        return None;
-    }
+    let stat = rustix::fs::statvfs(path).ok()?;
 
     let block_size = if stat.f_frsize > 0 {
         stat.f_frsize
     } else {
         stat.f_bsize
-    } as u64;
+    };
     if block_size == 0 {
         return None;
     }
 
-    let total = (stat.f_blocks as u64).saturating_mul(block_size);
-    let free = (stat.f_bfree as u64).saturating_mul(block_size);
-    let available = (stat.f_bavail as u64).saturating_mul(block_size);
+    let total = stat.f_blocks.saturating_mul(block_size);
+    let free = stat.f_bfree.saturating_mul(block_size);
+    let available = stat.f_bavail.saturating_mul(block_size);
 
-    Some((
-        total,
-        total.saturating_sub(free),
-        available.min(total),
-    ))
+    Some((total, total.saturating_sub(free), available.min(total)))
 }
 
 /// Filesystem type for `mount_point`, parsed from the kernel mount table.

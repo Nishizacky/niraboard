@@ -5,11 +5,13 @@ mod event;
 mod system;
 mod ui;
 
+use std::env;
+use std::ffi::OsString;
 use std::io::{self, IsTerminal};
 use std::panic;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use ratatui::DefaultTerminal;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -26,7 +28,36 @@ use ui::HitAreas;
 
 const TICK: Duration = Duration::from_secs(2);
 
+const USAGE: &str = "\
+niraboard - a compact laptop power dashboard for the terminal
+
+Usage: niraboard [OPTION]
+
+Options:
+  -h, --help                  Print this help and exit
+  -V, --version               Print the version and exit
+      --print-default-config  Print the default configuration as TOML and exit
+";
+
 fn main() -> Result<()> {
+    match Command::from_args()? {
+        Command::Run => run_dashboard(),
+        Command::Help => {
+            print!("{USAGE}");
+            Ok(())
+        }
+        Command::Version => {
+            println!("niraboard {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        Command::PrintDefaultConfig => {
+            print!("{}", Config::default().to_toml());
+            Ok(())
+        }
+    }
+}
+
+fn run_dashboard() -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         bail!("niraboard must be run from an interactive terminal");
     }
@@ -39,6 +70,42 @@ fn main() -> Result<()> {
 
     result?;
     restore_result
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Command {
+    Run,
+    Help,
+    Version,
+    PrintDefaultConfig,
+}
+
+impl Command {
+    fn from_args() -> Result<Self> {
+        Self::parse(env::args_os().skip(1))
+    }
+
+    fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self> {
+        let args = args
+            .into_iter()
+            .map(|arg| {
+                arg.into_string().map_err(|arg| {
+                    anyhow!("argument is not valid UTF-8: {}", arg.to_string_lossy())
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        match args.as_slice() {
+            [] => Ok(Self::Run),
+            [arg] => match arg.as_str() {
+                "-h" | "--help" => Ok(Self::Help),
+                "-V" | "--version" => Ok(Self::Version),
+                "--print-default-config" => Ok(Self::PrintDefaultConfig),
+                other => bail!("unknown option `{other}`\n\n{USAGE}"),
+            },
+            _ => bail!("unexpected arguments `{}`\n\n{USAGE}", args.join(" ")),
+        }
+    }
 }
 
 fn run(session: &mut TerminalSession) -> Result<()> {
@@ -192,4 +259,35 @@ fn install_panic_hook() {
         let _ = restore_terminal();
         previous(info);
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Command> {
+        Command::parse(args.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn no_arguments_runs_the_dashboard() {
+        assert_eq!(parse(&[]).expect("no arguments"), Command::Run);
+    }
+
+    #[test]
+    fn parses_cli_options() {
+        assert_eq!(parse(&["--help"]).expect("help"), Command::Help);
+        assert_eq!(parse(&["-h"]).expect("help"), Command::Help);
+        assert_eq!(parse(&["--version"]).expect("version"), Command::Version);
+        assert_eq!(
+            parse(&["--print-default-config"]).expect("defaults"),
+            Command::PrintDefaultConfig
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_and_extra_arguments() {
+        assert!(parse(&["--wat"]).is_err());
+        assert!(parse(&["--help", "--version"]).is_err());
+    }
 }

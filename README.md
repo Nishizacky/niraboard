@@ -2,19 +2,20 @@
 
 A compact, keyboard-first laptop power dashboard for the terminal.
 
-`niraboard` is a small Ratatui/Crossterm TUI for CachyOS/Arch laptops. It shows
-battery, CPU, memory, disk, Wi-Fi, local/global IP addresses, power profile,
-brightness, and PipeWire volume in one screen, and lets you change the profile,
-brightness, volume, and mute state without leaving the terminal. Clicking the
-network card (or pressing `w`) opens NetworkManager's `nmtui` for connection
-changes. It is an on-demand utility: there is no daemon, no background service,
-and no polling when it is not running.
+`niraboard` is a small Ratatui/Crossterm TUI for Linux laptops, developed on
+CachyOS/Arch. It shows battery, CPU, memory, root filesystem, Wi-Fi, local and
+public IP addresses, power profile, brightness, and PipeWire volume on one
+screen, and lets you change the power profile, brightness, volume, and mute
+state without leaving the terminal. Clicking the network card (or pressing `w`)
+opens NetworkManager's `nmtui` for connection changes; the network data is
+refreshed when it exits.
 
-Colours, the startup layout, and the brightness/volume step sizes can be set in
-an optional TOML configuration file. See [Configuration](#configuration).
+It is an on-demand utility: there is no daemon, no background service, and no
+polling when it is not running. Colours, the startup layout, card order, and the
+brightness/volume step sizes come from an optional TOML configuration file.
 
 ```text
- WAYBOARD  ThinkPad L580  ·  laptop power                     Vertical · 2s tick
+ NIRABOARD  ThinkPad L580  ·  laptop power                    Vertical · 2s tick
 ╭ Battery ─────────────────────────────────────────────────────────────────────╮
 │████████████79% ██████▏                                                       │
 │ 79%  Not charging                                                            │
@@ -60,22 +61,129 @@ an optional TOML configuration file. See [Configuration](#configuration).
 │[-]         40%        [+]                                                    │
 │          [MUTE]                                                              │
 ╰──────────────────────────────────────────────────────────────────────────────╯
-tab focus  ←/→ adjust  m mute  v layout  w nmtui  1-3 profile  r refresh  q quit
-ready · click cards or buttons
+ tab focus  ←/→ adjust  m mute  v layout  w nmtui  1-3 profile  r refresh  q quit
+ ready · click cards or buttons
 ```
 
-## Controls
+## Requirements
+
+- Linux; the sysfs/procfs paths are Linux-specific (developed on CachyOS/Arch).
+- Rust 1.85 or newer (edition 2024; the CachyOS `rust` package is current).
+- `mold`, selected as the linker on Linux by `.cargo/config.toml`.
+- A true terminal for the dashboard. `--help`, `--version`, and
+  `--print-default-config` work without one.
+
+Runtime integrations are optional. Missing tools are shown as unavailable and
+never crash the application:
+
+| Integration | Used for |
+| --- | --- |
+| `/proc/stat`, `/proc/meminfo` | CPU utilisation and memory |
+| `statvfs` (via rustix), `/proc/self/mounts` | Root filesystem usage and filesystem type |
+| `/sys/class/power_supply` | Battery percentage, state, power, health |
+| `/sys/class/backlight` | Brightness reading |
+| `/sys/class/hwmon`, `/sys/class/thermal` | CPU temperature |
+| `brightnessctl` | Changing brightness |
+| `wpctl` (PipeWire/WirePlumber) | Default output volume and mute |
+| `nmcli` (NetworkManager) | Wi-Fi SSID, signal, link rate |
+| `ip` (iproute2) | Local IPv4 address used for the default route |
+| `curl` | Public IPv4 lookup over HTTPS |
+| `nmtui` (NetworkManager) | Interactive Wi-Fi and connection editor |
+| `powerprofilesctl` (power-profiles-daemon) | Changing power profile |
+| `busctl` (systemd) | Cheap read of the active profile property |
+| `upower` | Battery fallback when no sysfs battery exists |
+
+On Arch/CachyOS, the usual package set is:
+
+```sh
+sudo pacman -S --needed rust cargo mold brightnessctl networkmanager \
+  power-profiles-daemon pipewire wireplumber upower iproute2 curl
+```
+
+`powerprofilesctl` and `networkmanager` may already be installed and running.
+
+## Build and install
+
+### From source
+
+```sh
+git clone <your-repository> niraboard
+cd niraboard
+cargo build --release --locked
+./target/release/niraboard
+```
+
+`cargo run --release` works too. The release profile enables thin LTO and strips
+symbols; the resulting binary is about 1.3 MB on x86_64.
+
+### Cargo
+
+```sh
+cargo install --path . --locked
+```
+
+This places `niraboard` in `~/.cargo/bin`. Make sure that directory is in
+`PATH`.
+
+### System-wide
+
+```sh
+sudo install -Dm755 target/release/niraboard /usr/local/bin/niraboard
+```
+
+### Desktop entry
+
+`packaging/niraboard.desktop` lets `fuzzel` and other XDG application launchers
+find niraboard. Install it for the current user:
+
+```sh
+install -Dm644 packaging/niraboard.desktop \
+  ~/.local/share/applications/niraboard.desktop
+
+# optional, but refreshes desktop caches immediately
+update-desktop-database ~/.local/share/applications
+```
+
+Then search for `niraboard`. The entry uses `Terminal=true`, so the launcher
+opens it in the configured terminal (for example `terminal=foot -e`). If
+`niraboard` is not in the launcher's `PATH`, change `Exec=niraboard` in the
+installed file to an absolute path, such as
+`Exec=/home/you/.cargo/bin/niraboard`.
+
+## Usage
+
+### Command-line options
+
+```text
+Usage: niraboard [OPTION]
+
+Options:
+  -h, --help                  Print this help and exit
+  -V, --version               Print the version and exit
+      --print-default-config  Print the default configuration as TOML and exit
+```
+
+`--print-default-config` writes the built-in defaults to stdout in the same
+TOML format the configuration file uses. It does not read an existing file and
+does not need a terminal, so it can seed a configuration:
+
+```sh
+mkdir -p ~/.config/niraboard
+niraboard --print-default-config > ~/.config/niraboard/config.toml
+```
+
+### Controls
 
 | Input | Action |
 | --- | --- |
 | `tab` / `shift+tab` | Move focus between the power, brightness, and audio cards |
 | `←` / `→` or `h` / `l` | Adjust the focused card: cycle profile, brightness, or volume by the configured step |
 | `m` | Toggle mute |
-| `v` | Cycle the card layout (see below) |
+| `v` | Cycle the card layout (see [Layouts](#layouts)) |
 | `w` | Open `nmtui` to manage Wi-Fi connections |
 | `1` / `2` / `3` | Set `power-saver`, `balanced`, or `performance` directly |
 | `r` | Refresh all data immediately |
-| `q`, `Esc`, `Ctrl-C` | Quit cleanly |
+| `q`, `Esc`, `Ctrl-C` | Ask to quit; press `y` to confirm |
 | Mouse | Click a profile row, `[-]`, `[+]`, `[MUTE]`, a card to focus it, the network card, or the layout name in the header |
 
 Clicking `[-]` or `[+]` changes brightness or volume by the configured step
@@ -114,124 +222,11 @@ Because the application enables terminal mouse reporting, normal terminal text
 selection may need `Shift` while `niraboard` is open. This is a terminal
 convention, not a setting in `niraboard`.
 
-## Requirements
-
-- CachyOS or another Arch-based, Linux system
-- Rust 1.85 or newer (edition 2024; the CachyOS `rust` package is current)
-- A true terminal (the program refuses to start when stdin/stdout is not a TTY)
-
-Runtime integrations are optional. Missing tools are shown as unavailable and
-never crash the application:
-
-| Integration | Used for |
-| --- | --- |
-| `/proc/stat`, `/proc/meminfo` | CPU utilisation and memory |
-| `statvfs`, `/proc/self/mounts` | Root filesystem usage and filesystem type |
-| `/sys/class/power_supply` | Battery percentage, state, power, health |
-| `/sys/class/backlight` | Brightness reading |
-| `/sys/class/hwmon`, `/sys/class/thermal` | CPU temperature |
-| `brightnessctl` | Changing brightness |
-| `wpctl` (PipeWire/WirePlumber) | Default output volume and mute |
-| `nmcli` (NetworkManager) | Wi-Fi SSID, signal, link rate |
-| `ip` (iproute2) | Local IPv4 address used for the default route |
-| `curl` | Public IPv4 lookup over HTTPS |
-| `nmtui` (NetworkManager) | Interactive Wi-Fi and connection editor |
-| `powerprofilesctl` (power-profiles-daemon) | Changing power profile |
-| `busctl` (systemd) | Cheap read of the active profile property |
-| `upower` | Battery fallback when no sysfs battery exists |
-
-On Arch/CachyOS, the usual package set is:
-
-```sh
-sudo pacman -S --needed rust cargo brightnessctl networkmanager \
-  power-profiles-daemon pipewire wireplumber upower iproute2 curl
-```
-
-`powerprofilesctl` and `networkmanager` may already be installed and running.
-
-## Build and run
-
-```sh
-git clone <your-repository> niraboard
-cd niraboard
-cargo run --release
-# or
-cargo build --release
-./target/release/niraboard
-```
-
-The project uses `Cargo.lock`, so reproducible builds can use `--locked`:
-
-```sh
-cargo build --release --locked
-```
-
-The release profile enables thin LTO and strips symbols. The resulting binary
-is roughly 1 MB on x86_64.
-
-## Install
-
-For the current user:
-
-```sh
-cargo install --path . --locked
-```
-
-This places `niraboard` in `~/.cargo/bin`. Make sure that directory is in
-`PATH`.
-
-For a system-wide manual install:
-
-```sh
-sudo install -Dm755 target/release/niraboard /usr/local/bin/niraboard
-```
-
-### Arch/CachyOS package (optional)
-
-A `packaging/PKGBUILD` template is included. It expects a source tarball named
-`niraboard-0.1.0.tar.gz` next to the PKGBUILD. Create one from the source tree
-without needing a committed Git history:
-
-```sh
-mkdir -p packaging
-tar --exclude=target --exclude=.git \
-  --transform 's,^,niraboard-0.1.0/,' \
-  -czf packaging/niraboard-0.1.0.tar.gz \
-  Cargo.toml Cargo.lock src README.md LICENSE examples packaging/niraboard.desktop
-
-cd packaging
-makepkg -si
-```
-
-Update `pkgver`, the tarball name, and `url` in the PKGBUILD if you publish a
-release. The PKGBUILD lists runtime tools as optional dependencies and builds
-with `cargo build --release --locked`.
-
-### fuzzel and other launchers
-
-`packaging/niraboard.desktop` is a freedesktop entry that lets `fuzzel` (and
-other XDG application launchers) find niraboard. Install it for the current
-user:
-
-```sh
-install -Dm644 packaging/niraboard.desktop \
-  ~/.local/share/applications/niraboard.desktop
-
-# optional, but refreshes desktop caches immediately
-update-desktop-database ~/.local/share/applications
-```
-
-Then start `fuzzel` and search for `niraboard`. The entry uses `Terminal=true`,
-so fuzzel opens it in the terminal configured by its `terminal=` setting (for
-example `terminal=foot -e`). If `niraboard` is not in the `PATH` seen by fuzzel,
-change `Exec=niraboard` in the installed file to the absolute path, such as
-`Exec=/home/you/.cargo/bin/niraboard`.
-
 ## Configuration
 
 niraboard reads an optional TOML file. The first path that applies is used:
 
-1. `$WAYBOARD_CONFIG`
+1. `$NIRABOARD_CONFIG` (ignored when empty)
 2. `$XDG_CONFIG_HOME/niraboard/config.toml`
 3. `$HOME/.config/niraboard/config.toml`
 
@@ -278,6 +273,9 @@ Colours accept names (`cyan`, `light-blue`, `red`, ...), an ANSI index
 colours, unknown or duplicate card names, and steps outside 1-100 are reported
 in the footer; niraboard then starts with defaults instead of exiting.
 
+`--print-default-config` prints the same defaults without the explanatory
+comments. Use `examples/config.toml` when you want a documented starting file.
+
 ## Permissions and safety
 
 `niraboard` never runs anything with elevated privileges. It also never writes
@@ -318,7 +316,7 @@ The event loop wakes every 2 seconds. Data collection is deliberately split:
 
 | Data | Interval | Source |
 | --- | --- | --- |
-| CPU, memory, disk, battery, brightness | every tick (2 s) | sysfs/procfs, `statvfs` |
+| CPU, memory, disk, battery, brightness | every tick (2 s) | sysfs/procfs, `statvfs` via rustix |
 | Audio | 4 s | `wpctl get-volume` |
 | Wi-Fi and local IP | 15 s | `nmcli ... --rescan no`, `ip -4 route get` |
 | Global IP | 300 s | `curl https://api.ipify.org` |
@@ -338,15 +336,15 @@ half a second to start. `powerprofilesctl` remains the tool used for profile
 changes, as recommended by power-profiles-daemon.
 
 Rendering is immediate-mode, but it is not unconditional: each refresh produces
-a typed `Metrics` snapshot, and the loop only redraws when that snapshot,
-the focus, the status message, or the terminal size changes. A 2-second tick
-does not automatically mean 2-second redraws.
+a typed `Metrics` snapshot, and the loop only redraws when that snapshot, the
+focus, the status message, or the terminal size changes. A 2-second tick does
+not automatically mean 2-second redraws.
 
 ## Architecture
 
 ```text
 src/
-├── main.rs          terminal setup/restore, event/tick loop
+├── main.rs          terminal setup/restore, event/tick loop, CLI options
 ├── app.rs           application state, focus, key/mouse handling, actions
 ├── config.rs        TOML loading, colours, startup layout, card order, steps
 ├── event.rs         crossterm event polling
@@ -359,47 +357,32 @@ src/
     ├── battery.rs   sysfs battery + UPower fallback
     ├── cpu.rs       /proc/stat delta sampler, model, threads, temperature, frequency
     ├── memory.rs    /proc/meminfo
-    ├── disk.rs      statvfs usage and mount table filesystem type
+    ├── disk.rs      filesystem usage via rustix and mount table filesystem type
     ├── network.rs   nmcli parsing, local/global IP lookup
     ├── audio.rs     wpctl parsing
     ├── power_profile.rs
     └── backlight.rs
 ```
 
-### Ratatui concepts used
+### Implementation notes
 
-- **`Terminal` and `CrosstermBackend`**: `niraboard` owns setup and teardown
+- **Terminal ownership**: niraboard sets up and tears down the terminal itself
   instead of using `ratatui::init`, because it also enables mouse capture. A
   `TerminalSession` guard restores raw mode, mouse reporting, the cursor, and
   the alternate screen on normal exit, on errors, and during unwinding. The same
-  guard can temporarily suspend niraboard while `nmtui` runs, then resume and
-  clear the screen. A panic hook additionally restores the terminal before the
-  panic message is printed.
+  guard can suspend niraboard while `nmtui` runs, then resume and clear the
+  screen. A panic hook restores the terminal before printing the panic message.
 - **Immediate-mode rendering**: every draw describes the whole screen from
   `App` state. Widgets are cheap values constructed per frame; there is no
   retained widget tree to synchronise.
-- **`Frame` and `Rect`**: the frame exposes the terminal area. The UI splits it
-  with nested `Layout` calls. Rects are the single source of truth for both
-  drawing and mouse hit-testing.
-- **`Layout` constraints**: `Length(1)` reserves the header and footer;
-  `Fill(1)` divides the remaining body between the rows of cards. `Vertical` is
-  one card per row; the grid layouts use a small `equal_spans` helper so every
-  card has the same size. `card_rects` walks the configured card order and drops
-  any rows that do not fit, which keeps rendering and hit areas consistent.
-- **`Block`, `Gauge`, `Paragraph`**: rounded bordered cards, one-line gauges,
-  and styled `Line`/`Span` content. The layout uses only built-in widgets, which
-  makes the rendering easy to follow.
-- **Application state instead of `StatefulWidget`**: the selectable profile rows
-  and focus state are part of `App`. A `StatefulWidget`/`ListState` would add
-  indirection without saving anything at this size.
-- **Hit areas**: `ui::draw` returns `HitAreas` (card rects, profile rows,
-  button rects, and the network card). `main` stores them in `App`; mouse events
-  call `HitAreas::action_at`, which maps coordinates to a small `ClickAction`
-  enum. Rendering and input therefore share one layout definition.
+- **Rects and hit areas**: `ui::draw` returns `HitAreas` (card rects, profile
+  rows, button rects, and the network card). `main` stores them in `App`; mouse
+  events call `HitAreas::action_at`, which maps coordinates to a small
+  `ClickAction` enum. Rendering and input therefore share one layout definition.
 - **Dirty redraw**: `App::tick` and `App::handle_event` return whether anything
-  visible changed. `main` draws only when that flag is set.
-- **Typed snapshots**: `Metrics` contains `Option`s for unavailable sources and
-  derives `PartialEq`. That is both the UI model and the change detector.
+  visible changed. `main` draws only when that flag is set. `Metrics` holds
+  `Option`s for unavailable sources and derives `PartialEq`, so the same typed
+  snapshot is both the UI model and the change detector.
 
 ### Why no async runtime?
 
@@ -414,10 +397,10 @@ profiles. Making that action non-blocking is listed as a future improvement.
 ## Known limitations
 
 - Linux-only; the sysfs/procfs paths are intentionally not portable.
-- The interface is tuned for at least 72×22 and looks best at 80×30 or larger
-  in the default `Vertical` layout; the grid layouts fit shorter terminals.
-  Cards that cannot fit are omitted rather than clipped; at very small sizes the
-  screen shows a one-line size hint.
+- The interface has a hard minimum of 72×22. The default `Vertical` layout looks
+  best at 80×30 or larger; the grid layouts fit shorter terminals. Cards that
+  cannot fit are omitted rather than clipped, and at very small sizes the screen
+  shows a centered size hint.
 - Battery power draw depends on firmware. Many laptops report `0` while on AC,
   not charging, or under a charge threshold, in which case `niraboard` shows
   `—`.
@@ -463,4 +446,4 @@ profiles. Making that action non-blocking is listed as a future improvement.
 
 ## License
 
-MIT. See `LICENSE`.
+MIT. See [`LICENSE`](LICENSE).

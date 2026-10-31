@@ -133,6 +133,16 @@ impl LayoutMode {
         }
     }
 
+    /// Name used for this layout in the configuration file.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Vertical => "vertical",
+            Self::Horizontal => "horizontal",
+            Self::TwoColumns => "2-columns",
+            Self::ThreeColumns => "3-columns",
+        }
+    }
+
     /// Parse a layout name from the configuration file.
     pub fn from_name(name: &str) -> Option<Self> {
         let normalized = name.to_ascii_lowercase().replace([' ', '-', '_'], "");

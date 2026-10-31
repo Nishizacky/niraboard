@@ -139,6 +139,39 @@ impl Config {
 
         Ok(config)
     }
+
+    /// Render this configuration as TOML.
+    ///
+    /// Used by `--print-default-config`; every value is taken from the live
+    /// defaults, so the output cannot drift from what a missing file produces.
+    pub fn to_toml(&self) -> String {
+        let cards = self
+            .cards
+            .iter()
+            .map(|card| format!("    \"{}\",\n", card.name()))
+            .collect::<String>();
+
+        format!(
+            "layout = \"{}\"\n\
+             \n\
+             cards = [\n\
+             {cards}\
+             ]\n\
+             \n\
+             [colors]\n\
+             main = \"{}\"\n\
+             bar = \"{}\"\n\
+             \n\
+             [steps]\n\
+             brightness = {}\n\
+             volume = {}\n",
+            self.layout.name(),
+            self.colors.main,
+            self.colors.bar,
+            self.steps.brightness,
+            self.steps.volume,
+        )
+    }
 }
 
 /// Location of the configuration file, if a home/config directory is known.
@@ -156,7 +189,7 @@ pub fn path() -> Option<PathBuf> {
                 .map(|home| PathBuf::from(home).join(".config"))
         })?;
 
-    Some(base.join("board").join("config.toml"))
+    Some(base.join("niraboard").join("config.toml"))
 }
 
 fn parse_color(value: &str, key: &str) -> Result<Color> {
@@ -218,6 +251,16 @@ struct RawSteps {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_config_renders_as_parseable_toml() {
+        let text = Config::default().to_toml();
+
+        assert_eq!(
+            Config::parse(&text).expect("rendered config"),
+            Config::default()
+        );
+    }
 
     #[test]
     fn missing_file_uses_defaults() {
