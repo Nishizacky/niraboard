@@ -31,9 +31,20 @@ cards = [
 # or a hexadecimal value such as "#4fc3f7".
 main = "cyan"
 
-# Normal fill colour of gauges. Warning and critical states stay
-# yellow/red.
+# Normal fill colour of gauges. Warning and critical states use
+# warn / bad below.
 bar = "green"
+
+# Regular values shown in cards.
+text = "gray"
+
+# Labels, hints, and secondary information.
+muted = "dark-gray"
+
+# State colours: connected/healthy, warning, and critical/error.
+ok = "green"
+warn = "yellow"
+bad = "red"
 
 [steps]
 # Percentage changed by one brightness / volume adjustment.

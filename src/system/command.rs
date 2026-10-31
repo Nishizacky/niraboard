@@ -1,4 +1,7 @@
+use std::ffi::OsString;
 use std::io::ErrorKind;
+use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 use anyhow::{Result, bail};
@@ -54,6 +57,31 @@ pub fn run_interactive(program: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Start a program without waiting for it to finish.
+///
+/// This is used to open a terminal emulator from a desktop launcher. `stdin`
+/// is /dev/null because the child creates its own terminal; stdout and stderr
+/// stay inherited so the emulator can report its own errors. The child gets
+/// its own process group so it survives the caller closing its terminal.
+pub fn spawn_detached(program: &Path, args: &[OsString], envs: &[(&str, &str)]) -> Result<()> {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .envs(envs.iter().copied())
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .process_group(0);
+
+    command.spawn().map(|_| ()).map_err(|error| {
+        if error.kind() == ErrorKind::NotFound {
+            anyhow::anyhow!("{} not found in PATH", program.display())
+        } else {
+            anyhow::Error::new(error).context(format!("failed to run {}", program.display()))
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,6 +95,13 @@ mod tests {
     #[test]
     fn missing_interactive_program_is_reported_without_panicking() {
         let error = run_interactive("niraboard-command-that-does-not-exist", &[]).unwrap_err();
+        assert!(error.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn missing_detached_program_is_reported_without_panicking() {
+        let error = spawn_detached(Path::new("niraboard-command-that-does-not-exist"), &[], &[])
+            .unwrap_err();
         assert!(error.to_string().contains("not found"));
     }
 }

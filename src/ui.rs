@@ -8,14 +8,16 @@ use crate::app::{App, Card, Focus, LayoutMode, StatusLevel};
 use crate::config::{Colors, Steps};
 use crate::system::{Battery, ChargeState, PowerProfile};
 
-const OK: Color = Color::Green;
-const WARN: Color = Color::Yellow;
-const BAD: Color = Color::Red;
-const DIM: Color = Color::DarkGray;
-const LABEL: Color = Color::Gray;
-
+/// Smallest terminal width that keeps the header, footer, and a single card
+/// readable. Wider layouts add one [`MIN_CARD_WIDTH`] per extra column.
 const MIN_WIDTH: u16 = 72;
-const MIN_HEIGHT: u16 = 22;
+/// A card needs two border rows plus enough room for its interactive content.
+const MIN_CARD_HEIGHT: u16 = 5;
+/// Width of one card in a multi-column layout. Three columns plus the two
+/// one-cell gaps add up to the 72-cell base width.
+const MIN_CARD_WIDTH: u16 = 23;
+const HEADER_HEIGHT: u16 = 1;
+const FOOTER_HEIGHT: u16 = 2;
 const COLUMN_GAP: u16 = 1;
 
 /// Screen rectangles recorded during rendering so mouse events can be mapped
@@ -92,16 +94,17 @@ fn contains(rect: Option<Rect>, position: Position) -> bool {
 pub fn draw(frame: &mut Frame, app: &App) -> HitAreas {
     let area = frame.area();
     let colors = app.config.colors;
+    let (min_width, min_height) = minimum_size(app.layout, app.config.cards.len());
 
-    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
-        draw_too_small(frame, area);
+    if area.width < min_width || area.height < min_height {
+        draw_too_small(frame, area, min_width, min_height, colors);
         return HitAreas::default();
     }
 
     let [header, body, footer] = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(HEADER_HEIGHT),
         Constraint::Fill(1),
-        Constraint::Length(2),
+        Constraint::Length(FOOTER_HEIGHT),
     ])
     .areas(area);
 
@@ -122,14 +125,45 @@ pub fn draw(frame: &mut Frame, app: &App) -> HitAreas {
 }
 
 fn draw_body(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitAreas, colors: Colors) {
-    let columns = match app.layout {
-        LayoutMode::Vertical => 1,
-        LayoutMode::Horizontal => app.config.cards.len().max(1),
-        LayoutMode::TwoColumns => 2,
-        LayoutMode::ThreeColumns => 3,
-    };
+    let columns = layout_columns(app.layout, app.config.cards.len());
 
     draw_grid(frame, area, app, hits, columns, colors);
+}
+
+/// Number of columns a layout uses for `card_count` configured cards. The grid
+/// layouts never use more columns than there are cards to show.
+fn layout_columns(layout: LayoutMode, card_count: usize) -> usize {
+    let card_count = card_count.max(1);
+
+    match layout {
+        LayoutMode::Vertical => 1,
+        LayoutMode::Horizontal => card_count,
+        LayoutMode::TwoColumns => 2.min(card_count),
+        LayoutMode::ThreeColumns => 3.min(card_count),
+    }
+}
+
+/// Smallest terminal size that can show every configured card in `layout`
+/// without squeezing rows below their usable height. Each layout has a
+/// different bottleneck: `Vertical` needs height for its card rows, while
+/// `Horizontal` needs width for its card columns.
+fn minimum_size(layout: LayoutMode, card_count: usize) -> (u16, u16) {
+    let card_count = card_count.max(1);
+    let columns = layout_columns(layout, card_count);
+    let rows = card_count.div_ceil(columns);
+    let gap = if columns > 1 { COLUMN_GAP } else { 0 };
+
+    let columns = u16::try_from(columns).unwrap_or(u16::MAX);
+    let rows = u16::try_from(rows).unwrap_or(u16::MAX);
+    let width = columns
+        .saturating_mul(MIN_CARD_WIDTH)
+        .saturating_add(gap.saturating_mul(columns.saturating_sub(1)))
+        .max(MIN_WIDTH);
+    let height = HEADER_HEIGHT
+        .saturating_add(FOOTER_HEIGHT)
+        .saturating_add(rows.saturating_mul(MIN_CARD_HEIGHT));
+
+    (width, height)
 }
 
 /// Arrange the configured cards in a row-major grid, in the order given by the
@@ -265,7 +299,9 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitAreas, co
         Span::raw(" "),
         Span::styled(
             app.identity.as_str(),
-            Style::default().fg(LABEL).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(colors.text)
+                .add_modifier(Modifier::BOLD),
         ),
     ]);
     frame.render_widget(Paragraph::new(title), columns[0]);
@@ -277,7 +313,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitAreas, co
                 .fg(colors.main)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" · 2s tick", Style::default().fg(DIM)),
+        Span::styled(" · 2s tick", Style::default().fg(colors.muted)),
     ]))
     .alignment(Alignment::Right);
     hits.layout = Some(columns[1]);
@@ -306,14 +342,14 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, colors: Colors) {
         Span::raw(" quit"),
     ]);
     frame.render_widget(
-        Paragraph::new(help).style(Style::default().fg(DIM)),
+        Paragraph::new(help).style(Style::default().fg(colors.muted)),
         rows[0],
     );
 
     let (text, color) = match app.status_text() {
-        Some((text, StatusLevel::Info)) => (text, OK),
-        Some((text, StatusLevel::Error)) => (text, BAD),
-        None => ("ready · click cards or buttons", DIM),
+        Some((text, StatusLevel::Info)) => (text, colors.ok),
+        Some((text, StatusLevel::Error)) => (text, colors.bad),
+        None => ("ready · click cards or buttons", colors.muted),
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(text, Style::default().fg(color)))),
@@ -327,7 +363,7 @@ fn draw_battery(frame: &mut Frame, area: Rect, app: &App, colors: Colors) {
     frame.render_widget(block, area);
 
     let Some(battery) = app.monitor.metrics.battery.as_ref() else {
-        centered_message(frame, inner, &["Battery unavailable"], DIM);
+        centered_message(frame, inner, &["Battery unavailable"], colors.muted);
         return;
     };
     if inner.is_empty() {
@@ -363,7 +399,11 @@ fn draw_battery(frame: &mut Frame, area: Rect, app: &App, colors: Colors) {
     } else {
         "On battery"
     };
-    let ac_color = if battery.ac_online { OK } else { WARN };
+    let ac_color = if battery.ac_online {
+        colors.ok
+    } else {
+        colors.warn
+    };
 
     let lines = vec![
         Line::from(vec![
@@ -372,20 +412,20 @@ fn draw_battery(frame: &mut Frame, area: Rect, app: &App, colors: Colors) {
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::styled(battery.state.label(), Style::default().fg(LABEL)),
+            Span::styled(battery.state.label(), Style::default().fg(colors.text)),
         ]),
         Line::from(vec![
             Span::styled(ac_text, Style::default().fg(ac_color)),
-            Span::styled(" · ", Style::default().fg(DIM)),
-            Span::styled(energy, Style::default().fg(DIM)),
+            Span::styled(" · ", Style::default().fg(colors.muted)),
+            Span::styled(energy, Style::default().fg(colors.muted)),
         ]),
         Line::from(vec![
-            Span::styled("Draw   ", Style::default().fg(DIM)),
-            Span::styled(draw, Style::default().fg(LABEL)),
+            Span::styled("Draw   ", Style::default().fg(colors.muted)),
+            Span::styled(draw, Style::default().fg(colors.text)),
         ]),
         Line::from(vec![
-            Span::styled("Health ", Style::default().fg(DIM)),
-            Span::styled(health, Style::default().fg(LABEL)),
+            Span::styled("Health ", Style::default().fg(colors.muted)),
+            Span::styled(health, Style::default().fg(colors.text)),
         ]),
     ];
     frame.render_widget(Paragraph::new(lines), rows[1]);
@@ -403,8 +443,8 @@ fn draw_cpu(frame: &mut Frame, area: Rect, app: &App, colors: Colors) {
     let rows = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).split(inner);
     let color = cpu
         .usage_percent
-        .map(|usage| usage_color(usage, 70, 90, colors.bar))
-        .unwrap_or(DIM);
+        .map(|usage| usage_color(usage, 70, 90, colors))
+        .unwrap_or(colors.muted);
     let label = cpu
         .usage_percent
         .map(|usage| format!("{usage}%"))
@@ -425,7 +465,10 @@ fn draw_cpu(frame: &mut Frame, area: Rect, app: &App, colors: Colors) {
         .temp_c
         .map(|temperature| format!("{temperature:.1} °C"))
         .unwrap_or_else(|| "—".to_owned());
-    let temperature_color = cpu.temp_c.map(temp_color).unwrap_or(DIM);
+    let temperature_color = cpu
+        .temp_c
+        .map(|temperature| temp_color(temperature, colors))
+        .unwrap_or(colors.muted);
     let frequency = cpu
         .freq_mhz
         .map(|frequency| format!("{:.2} GHz", frequency as f32 / 1000.0))
@@ -440,26 +483,26 @@ fn draw_cpu(frame: &mut Frame, area: Rect, app: &App, colors: Colors) {
 
     let lines = vec![
         Line::from(vec![
-            Span::styled("Usage   ", Style::default().fg(DIM)),
+            Span::styled("Usage   ", Style::default().fg(colors.muted)),
             Span::styled(
                 usage,
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(vec![
-            Span::styled("Temp    ", Style::default().fg(DIM)),
+            Span::styled("Temp    ", Style::default().fg(colors.muted)),
             Span::styled(temperature, Style::default().fg(temperature_color)),
             Span::raw("   "),
-            Span::styled("Freq  ", Style::default().fg(DIM)),
-            Span::styled(frequency, Style::default().fg(LABEL)),
+            Span::styled("Freq  ", Style::default().fg(colors.muted)),
+            Span::styled(frequency, Style::default().fg(colors.text)),
         ]),
         Line::from(vec![
-            Span::styled("Threads ", Style::default().fg(DIM)),
-            Span::styled(threads, Style::default().fg(LABEL)),
+            Span::styled("Threads ", Style::default().fg(colors.muted)),
+            Span::styled(threads, Style::default().fg(colors.text)),
         ]),
         Line::from(vec![
-            Span::styled("Model   ", Style::default().fg(DIM)),
-            Span::styled(model, Style::default().fg(LABEL)),
+            Span::styled("Model   ", Style::default().fg(colors.muted)),
+            Span::styled(model, Style::default().fg(colors.text)),
         ]),
     ];
     frame.render_widget(Paragraph::new(lines), rows[1]);
@@ -471,7 +514,7 @@ fn draw_memory(frame: &mut Frame, area: Rect, app: &App, colors: Colors) {
     frame.render_widget(block, area);
 
     let Some(memory) = app.monitor.metrics.memory.as_ref() else {
-        centered_message(frame, inner, &["Memory unavailable"], DIM);
+        centered_message(frame, inner, &["Memory unavailable"], colors.muted);
         return;
     };
     if inner.is_empty() {
@@ -479,7 +522,7 @@ fn draw_memory(frame: &mut Frame, area: Rect, app: &App, colors: Colors) {
     }
 
     let rows = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).split(inner);
-    let color = usage_color(memory.percent, 70, 90, colors.bar);
+    let color = usage_color(memory.percent, 70, 90, colors);
     render_gauge(
         frame,
         rows[0],
@@ -493,10 +536,10 @@ fn draw_memory(frame: &mut Frame, area: Rect, app: &App, colors: Colors) {
     let available = gib(memory.available_bytes);
     let lines = vec![
         Line::from(vec![
-            Span::styled("Used  ", Style::default().fg(DIM)),
+            Span::styled("Used  ", Style::default().fg(colors.muted)),
             Span::styled(
                 format!("{used:.1} / {total:.1} GiB"),
-                Style::default().fg(LABEL),
+                Style::default().fg(colors.text),
             ),
         ]),
         Line::from(vec![
@@ -504,7 +547,7 @@ fn draw_memory(frame: &mut Frame, area: Rect, app: &App, colors: Colors) {
                 format!("{available:.1} GiB"),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" available", Style::default().fg(DIM)),
+            Span::styled(" available", Style::default().fg(colors.muted)),
         ]),
     ];
     frame.render_widget(Paragraph::new(lines), rows[1]);
@@ -516,7 +559,7 @@ fn draw_disk(frame: &mut Frame, area: Rect, app: &App, colors: Colors) {
     frame.render_widget(block, area);
 
     let Some(disk) = app.monitor.metrics.disk.as_ref() else {
-        centered_message(frame, inner, &["Disk unavailable"], DIM);
+        centered_message(frame, inner, &["Disk unavailable"], colors.muted);
         return;
     };
     if inner.is_empty() {
@@ -524,7 +567,7 @@ fn draw_disk(frame: &mut Frame, area: Rect, app: &App, colors: Colors) {
     }
 
     let rows = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).split(inner);
-    let color = usage_color(disk.percent, 70, 90, colors.bar);
+    let color = usage_color(disk.percent, 70, 90, colors);
     render_gauge(
         frame,
         rows[0],
@@ -539,15 +582,15 @@ fn draw_disk(frame: &mut Frame, area: Rect, app: &App, colors: Colors) {
     let filesystem = fit(&filesystem, inner.width.saturating_sub(8));
     let lines = vec![
         Line::from(vec![
-            Span::styled("Used  ", Style::default().fg(DIM)),
+            Span::styled("Used  ", Style::default().fg(colors.muted)),
             Span::styled(
                 format!("{used:.1} / {total:.1} GiB"),
-                Style::default().fg(LABEL),
+                Style::default().fg(colors.text),
             ),
         ]),
         Line::from(vec![
-            Span::styled("FS    ", Style::default().fg(DIM)),
-            Span::styled(filesystem, Style::default().fg(LABEL)),
+            Span::styled("FS    ", Style::default().fg(colors.muted)),
+            Span::styled(filesystem, Style::default().fg(colors.text)),
         ]),
     ];
     frame.render_widget(Paragraph::new(lines), rows[1]);
@@ -571,9 +614,9 @@ fn draw_wifi(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitAreas, colo
     let Some(wifi) = app.monitor.metrics.wifi.as_ref() else {
         let mut lines = vec![Line::from(Span::styled(
             "NetworkManager unavailable",
-            Style::default().fg(DIM),
+            Style::default().fg(colors.muted),
         ))];
-        lines.extend(ip_lines(app));
+        lines.extend(ip_lines(app, colors));
         lines.push(click_hint);
         frame.render_widget(Paragraph::new(lines), inner);
         return;
@@ -583,14 +626,16 @@ fn draw_wifi(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitAreas, colo
         let mut lines = vec![
             Line::from(Span::styled(
                 "○ Disconnected",
-                Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(colors.warn)
+                    .add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
                 "No active Wi-Fi connection",
-                Style::default().fg(DIM),
+                Style::default().fg(colors.muted),
             )),
         ];
-        lines.extend(ip_lines(app));
+        lines.extend(ip_lines(app, colors));
         lines.push(click_hint);
         frame.render_widget(Paragraph::new(lines), inner);
         return;
@@ -605,38 +650,43 @@ fn draw_wifi(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitAreas, colo
         .signal
         .map(|signal| format!("{signal}%"))
         .unwrap_or_else(|| "—".to_owned());
-    let signal_color = wifi.signal.map(signal_color).unwrap_or(DIM);
+    let signal_color = wifi
+        .signal
+        .map(|signal| signal_color(signal, colors))
+        .unwrap_or(colors.muted);
 
     let mut signal_line = vec![
-        Span::styled("Signal ", Style::default().fg(DIM)),
+        Span::styled("Signal ", Style::default().fg(colors.muted)),
         Span::styled(signal, Style::default().fg(signal_color)),
     ];
     if let Some(rate) = wifi.rate_mbps {
-        signal_line.push(Span::styled(" · ", Style::default().fg(DIM)));
+        signal_line.push(Span::styled(" · ", Style::default().fg(colors.muted)));
         signal_line.push(Span::styled(
             format!("{rate} Mb/s"),
-            Style::default().fg(LABEL),
+            Style::default().fg(colors.text),
         ));
     }
 
     let mut lines = vec![
         Line::from(Span::styled(
             "● Connected",
-            Style::default().fg(OK).add_modifier(Modifier::BOLD),
+            Style::default().fg(colors.ok).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
             ssid,
-            Style::default().fg(LABEL).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(colors.text)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(signal_line),
     ];
-    lines.extend(ip_lines(app));
+    lines.extend(ip_lines(app, colors));
     lines.push(click_hint);
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Local and global IP addresses, shown even when Wi-Fi itself is unavailable.
-fn ip_lines(app: &App) -> Vec<Line<'static>> {
+fn ip_lines(app: &App, colors: Colors) -> Vec<Line<'static>> {
     let local = app
         .monitor
         .metrics
@@ -652,12 +702,12 @@ fn ip_lines(app: &App) -> Vec<Line<'static>> {
 
     vec![
         Line::from(vec![
-            Span::styled("Local  ", Style::default().fg(DIM)),
-            Span::styled(local, Style::default().fg(LABEL)),
+            Span::styled("Local  ", Style::default().fg(colors.muted)),
+            Span::styled(local, Style::default().fg(colors.text)),
         ]),
         Line::from(vec![
-            Span::styled("Global ", Style::default().fg(DIM)),
-            Span::styled(public, Style::default().fg(LABEL)),
+            Span::styled("Global ", Style::default().fg(colors.muted)),
+            Span::styled(public, Style::default().fg(colors.text)),
         ]),
     ]
 }
@@ -686,9 +736,9 @@ fn draw_power(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitAreas, col
         let active = app.monitor.metrics.power_profile == Some(*profile);
         let marker = if active { "●" } else { " " };
         let style = if active {
-            Style::default().fg(OK).add_modifier(Modifier::BOLD)
+            Style::default().fg(colors.ok).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(DIM)
+            Style::default().fg(colors.muted)
         };
 
         frame.render_widget(
@@ -707,12 +757,12 @@ fn draw_power(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitAreas, col
     } else {
         "daemon unavailable"
     };
-    let hint_color = if available { DIM } else { BAD };
+    let hint_color = if available { colors.muted } else { colors.bad };
     let lines = vec![
         Line::from(Span::styled(hint, Style::default().fg(hint_color))),
         Line::from(Span::styled(
             "power-profiles-daemon",
-            Style::default().fg(DIM),
+            Style::default().fg(colors.muted),
         )),
     ];
     frame.render_widget(Paragraph::new(lines), rows[3]);
@@ -726,7 +776,7 @@ fn draw_brightness(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitAreas
     hits.cards.push((area, Focus::Brightness));
 
     let Some(brightness) = app.monitor.metrics.brightness.as_ref() else {
-        centered_message(frame, inner, &["backlight unavailable"], DIM);
+        centered_message(frame, inner, &["backlight unavailable"], colors.muted);
         return;
     };
     if inner.is_empty() {
@@ -760,7 +810,7 @@ fn draw_brightness(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitAreas
             .fg(colors.main)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(LABEL)
+        Style::default().fg(colors.text)
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled("[-]", button_style))).alignment(Alignment::Center),
@@ -784,11 +834,11 @@ fn draw_brightness(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitAreas
     let lines = vec![
         Line::from(Span::styled(
             format!("{}% steps", app.config.steps.brightness),
-            Style::default().fg(DIM),
+            Style::default().fg(colors.muted),
         )),
         Line::from(Span::styled(
             brightness.device.as_str(),
-            Style::default().fg(DIM),
+            Style::default().fg(colors.muted),
         )),
     ];
     frame.render_widget(Paragraph::new(lines), rows[3]);
@@ -802,7 +852,7 @@ fn draw_audio(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitAreas, col
     hits.cards.push((area, Focus::Audio));
 
     let Some(audio) = app.monitor.metrics.audio.as_ref() else {
-        centered_message(frame, inner, &["PipeWire unavailable"], DIM);
+        centered_message(frame, inner, &["PipeWire unavailable"], colors.muted);
         return;
     };
     if inner.is_empty() {
@@ -818,9 +868,9 @@ fn draw_audio(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitAreas, col
     .split(inner);
 
     let color = if audio.muted {
-        BAD
+        colors.bad
     } else if audio.volume_percent > 100 {
-        WARN
+        colors.warn
     } else {
         colors.bar
     };
@@ -843,7 +893,7 @@ fn draw_audio(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitAreas, col
             .fg(colors.main)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(LABEL)
+        Style::default().fg(colors.text)
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled("[-]", button_style))).alignment(Alignment::Center),
@@ -865,9 +915,11 @@ fn draw_audio(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitAreas, col
     hits.volume_plus = Some(controls[2]);
 
     let mute_style = if audio.muted {
-        Style::default().fg(WARN).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(colors.warn)
+            .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(LABEL)
+        Style::default().fg(colors.text)
     };
     let mute_label = if audio.muted { "[UNMUTE]" } else { "[MUTE]" };
     frame.render_widget(
@@ -882,7 +934,11 @@ fn draw_audio(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitAreas, col
     } else {
         "PipeWire · default sink"
     };
-    let state_color = if audio.muted { BAD } else { DIM };
+    let state_color = if audio.muted {
+        colors.bad
+    } else {
+        colors.muted
+    };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             state,
@@ -893,13 +949,13 @@ fn draw_audio(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitAreas, col
 }
 
 fn card(title: &str, focused: bool, colors: Colors) -> Block<'static> {
-    let border_color = if focused { colors.main } else { DIM };
+    let border_color = if focused { colors.main } else { colors.muted };
     let title_style = if focused {
         Style::default()
             .fg(colors.main)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(LABEL)
+        Style::default().fg(colors.text)
     };
 
     Block::default()
@@ -951,16 +1007,13 @@ fn centered_message(frame: &mut Frame, area: Rect, lines: &[&str], color: Color)
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), middle);
 }
 
-fn draw_too_small(frame: &mut Frame, area: Rect) {
+fn draw_too_small(frame: &mut Frame, area: Rect, width: u16, height: u16, colors: Colors) {
+    let required = format!("need at least {width} x {height}");
     centered_message(
         frame,
         area,
-        &[
-            "Terminal too small",
-            "need at least 72 x 22",
-            "press q to quit",
-        ],
-        WARN,
+        &["Terminal too small", required.as_str(), "press q to quit"],
+        colors.warn,
     );
 }
 
@@ -990,14 +1043,22 @@ fn draw_quit_confirmation(frame: &mut Frame, area: Rect, colors: Colors) {
     let lines = vec![
         Line::from(vec![Span::styled(
             "Quit? y",
-            Style::default().fg(WARN).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(colors.warn)
+                .add_modifier(Modifier::BOLD),
         )]),
         Line::from(vec![
             Span::raw("  "),
-            Span::styled("y", Style::default().fg(OK).add_modifier(Modifier::BOLD)),
-            Span::styled(" confirm  ", Style::default().fg(DIM)),
-            Span::styled("n", Style::default().fg(OK).add_modifier(Modifier::BOLD)),
-            Span::styled(" cancel", Style::default().fg(DIM)),
+            Span::styled(
+                "y",
+                Style::default().fg(colors.ok).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" confirm  ", Style::default().fg(colors.muted)),
+            Span::styled(
+                "n",
+                Style::default().fg(colors.ok).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" cancel", Style::default().fg(colors.muted)),
         ]),
     ];
     frame.render_widget(
@@ -1006,13 +1067,13 @@ fn draw_quit_confirmation(frame: &mut Frame, area: Rect, colors: Colors) {
     );
 }
 
-fn usage_color(percent: u8, warning: u8, critical: u8, ok: Color) -> Color {
+fn usage_color(percent: u8, warning: u8, critical: u8, colors: Colors) -> Color {
     if percent >= critical {
-        BAD
+        colors.bad
     } else if percent >= warning {
-        WARN
+        colors.warn
     } else {
-        ok
+        colors.bar
     }
 }
 
@@ -1020,31 +1081,31 @@ fn battery_color(battery: &Battery, colors: Colors) -> Color {
     if battery.state == ChargeState::Charging {
         colors.main
     } else if battery.percent <= 10 {
-        BAD
+        colors.bad
     } else if battery.percent <= 25 {
-        WARN
+        colors.warn
     } else {
         colors.bar
     }
 }
 
-fn temp_color(temperature: f32) -> Color {
+fn temp_color(temperature: f32, colors: Colors) -> Color {
     if temperature >= 85.0 {
-        BAD
+        colors.bad
     } else if temperature >= 70.0 {
-        WARN
+        colors.warn
     } else {
-        OK
+        colors.ok
     }
 }
 
-fn signal_color(signal: u8) -> Color {
+fn signal_color(signal: u8, colors: Colors) -> Color {
     if signal >= 70 {
-        OK
+        colors.ok
     } else if signal >= 40 {
-        WARN
+        colors.warn
     } else {
-        BAD
+        colors.bad
     }
 }
 
@@ -1143,8 +1204,8 @@ mod tests {
     }
 
     #[test]
-    fn renders_all_cards_at_80x24() {
-        let (screen, hits) = render(80, 24);
+    fn renders_all_cards_at_vertical_minimum() {
+        let (screen, hits) = render(72, 43);
 
         for label in [
             "NIRABOARD",
@@ -1221,6 +1282,33 @@ mod tests {
     fn shows_message_when_terminal_is_too_small() {
         let (screen, hits) = render(60, 18);
         assert!(screen.contains("Terminal too small"));
+        assert!(screen.contains("need at least 72 x 43"));
+        assert!(hits.profile_rows.is_empty());
+    }
+
+    #[test]
+    fn minimum_size_depends_on_layout() {
+        assert_eq!(minimum_size(LayoutMode::Vertical, 8), (72, 43));
+        assert_eq!(minimum_size(LayoutMode::Horizontal, 8), (191, 8));
+        assert_eq!(minimum_size(LayoutMode::TwoColumns, 8), (72, 23));
+        assert_eq!(minimum_size(LayoutMode::ThreeColumns, 8), (72, 18));
+    }
+
+    #[test]
+    fn minimum_size_follows_card_count() {
+        assert_eq!(minimum_size(LayoutMode::Vertical, 3), (72, 18));
+        assert_eq!(minimum_size(LayoutMode::Horizontal, 3), (72, 8));
+        assert_eq!(minimum_size(LayoutMode::TwoColumns, 3), (72, 13));
+        assert_eq!(minimum_size(LayoutMode::ThreeColumns, 3), (72, 8));
+    }
+
+    #[test]
+    fn horizontal_layout_needs_extra_width() {
+        // Tall enough for every card, but far too narrow for eight columns.
+        let (screen, hits) = render_layout(120, 60, LayoutMode::Horizontal);
+
+        assert!(screen.contains("Terminal too small"));
+        assert!(screen.contains("need at least 191 x 8"));
         assert!(hits.profile_rows.is_empty());
     }
 
@@ -1241,8 +1329,57 @@ mod tests {
     }
 
     #[test]
+    fn applies_configured_colours() {
+        let mut app = test_app();
+        app.monitor
+            .metrics
+            .battery
+            .as_mut()
+            .expect("battery")
+            .ac_online = true;
+        app.monitor
+            .metrics
+            .audio
+            .as_mut()
+            .expect("audio")
+            .volume_percent = 120;
+        app.config.colors = Colors {
+            main: Color::Rgb(1, 2, 3),
+            bar: Color::Rgb(4, 5, 6),
+            text: Color::Rgb(7, 8, 9),
+            muted: Color::Rgb(10, 11, 12),
+            ok: Color::Rgb(13, 14, 15),
+            warn: Color::Rgb(16, 17, 18),
+            bad: Color::Rgb(19, 20, 21),
+        };
+
+        let backend = TestBackend::new(120, 60);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                draw(frame, &app);
+            })
+            .expect("draw");
+
+        let cells = terminal.backend().buffer().content();
+        let used: Vec<Color> = cells.iter().flat_map(|cell| [cell.fg, cell.bg]).collect();
+
+        for (name, color) in [
+            ("main", app.config.colors.main),
+            ("bar", app.config.colors.bar),
+            ("text", app.config.colors.text),
+            ("muted", app.config.colors.muted),
+            ("ok", app.config.colors.ok),
+            ("warn", app.config.colors.warn),
+            ("bad", app.config.colors.bad),
+        ] {
+            assert!(used.contains(&color), "missing {name} colour");
+        }
+    }
+
+    #[test]
     fn maps_click_targets_to_actions() {
-        let (_, hits) = render_layout(120, 40, LayoutMode::Vertical);
+        let (_, hits) = render_layout(120, 60, LayoutMode::Vertical);
 
         let wifi = hits.wifi.expect("wifi card");
         assert_eq!(
@@ -1272,7 +1409,8 @@ mod tests {
     #[test]
     fn every_layout_renders_all_cards() {
         for layout in LayoutMode::ALL {
-            let (screen, _) = render_layout(120, 40, layout);
+            let (width, height) = minimum_size(layout, Card::ALL.len());
+            let (screen, _) = render_layout(width, height, layout);
             for label in [
                 "NIRABOARD",
                 "Battery",

@@ -2,6 +2,7 @@ mod actions;
 mod app;
 mod config;
 mod event;
+mod spawn;
 mod system;
 mod ui;
 
@@ -9,6 +10,7 @@ use std::env;
 use std::ffi::OsString;
 use std::io::{self, IsTerminal};
 use std::panic;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -36,12 +38,18 @@ Usage: niraboard [OPTION]
 Options:
   -h, --help                  Print this help and exit
   -V, --version               Print the version and exit
+  -c, --config <FILE>         Read configuration from FILE
+      --spawn-terminal        Open a terminal emulator for the dashboard when
+                              no terminal is attached
       --print-default-config  Print the default configuration as TOML and exit
 ";
 
 fn main() -> Result<()> {
     match Command::from_args()? {
-        Command::Run => run_dashboard(),
+        Command::Run {
+            config,
+            spawn_terminal,
+        } => run_dashboard(config, spawn_terminal),
         Command::Help => {
             print!("{USAGE}");
             Ok(())
@@ -51,30 +59,46 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::PrintDefaultConfig => {
-            print!("{}", Config::default().to_toml());
+            print!("{}", Config::default().to_toml()?);
             Ok(())
         }
     }
 }
 
-fn run_dashboard() -> Result<()> {
-    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        bail!("niraboard must be run from an interactive terminal");
+fn run_dashboard(config_path: Option<PathBuf>, spawn_terminal: bool) -> Result<()> {
+    let launch = spawn::decide(
+        io::stdin().is_terminal(),
+        io::stdout().is_terminal(),
+        spawn_terminal,
+        spawn::in_graphical_session(),
+        spawn::is_terminal_child(),
+    );
+
+    match launch {
+        spawn::Launch::Direct => {}
+        spawn::Launch::Relaunch => {
+            spawn::relaunch(config_path.as_deref())?;
+            return Ok(());
+        }
+        spawn::Launch::Refuse(refusal) => bail!("{}", spawn::refusal_message(refusal)),
     }
 
     install_panic_hook();
 
     let mut session = TerminalSession::start()?;
-    let result = run(&mut session);
+    let result = run(&mut session, config_path.as_deref());
     let restore_result = session.finish();
 
     result?;
     restore_result
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
-    Run,
+    Run {
+        config: Option<PathBuf>,
+        spawn_terminal: bool,
+    },
     Help,
     Version,
     PrintDefaultConfig,
@@ -95,21 +119,61 @@ impl Command {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        match args.as_slice() {
-            [] => Ok(Self::Run),
-            [arg] => match arg.as_str() {
-                "-h" | "--help" => Ok(Self::Help),
-                "-V" | "--version" => Ok(Self::Version),
-                "--print-default-config" => Ok(Self::PrintDefaultConfig),
-                other => bail!("unknown option `{other}`\n\n{USAGE}"),
-            },
-            _ => bail!("unexpected arguments `{}`\n\n{USAGE}", args.join(" ")),
+        if let [arg] = args.as_slice() {
+            match arg.as_str() {
+                "-h" | "--help" => return Ok(Self::Help),
+                "-V" | "--version" => return Ok(Self::Version),
+                "--print-default-config" => return Ok(Self::PrintDefaultConfig),
+                _ => {}
+            }
         }
+
+        let mut config = None;
+        let mut spawn_terminal = false;
+        let mut index = 0;
+
+        while let Some(arg) = args.get(index) {
+            index += 1;
+            match arg.as_str() {
+                "-c" | "--config" => {
+                    let Some(path) = args.get(index) else {
+                        bail!("option `{arg}` requires a file path\n\n{USAGE}");
+                    };
+                    if path.starts_with('-') {
+                        bail!("option `{arg}` requires a file path\n\n{USAGE}");
+                    }
+                    index += 1;
+                    config = Some(parse_config_path(path)?);
+                }
+                other if other.starts_with("--config=") => {
+                    let path = &other["--config=".len()..];
+                    config = Some(parse_config_path(path)?);
+                }
+                "--spawn-terminal" => spawn_terminal = true,
+                other if other.starts_with('-') => {
+                    bail!("unknown option `{other}`\n\n{USAGE}")
+                }
+                other => bail!("unexpected argument `{other}`\n\n{USAGE}"),
+            }
+        }
+
+        Ok(Self::Run {
+            config,
+            spawn_terminal,
+        })
     }
 }
 
-fn run(session: &mut TerminalSession) -> Result<()> {
-    let mut app = build_app();
+fn parse_config_path(path: &str) -> Result<PathBuf> {
+    if path.is_empty() {
+        bail!("option `--config` requires a file path\n\n{USAGE}");
+    }
+
+    Ok(PathBuf::from(path))
+}
+
+fn run(session: &mut TerminalSession, config_path: Option<&Path>) -> Result<()> {
+    let mut app = build_app(config_path);
     app.refresh_all();
 
     let mut dirty = true;
@@ -152,8 +216,8 @@ fn run(session: &mut TerminalSession) -> Result<()> {
 
 /// Load configuration, falling back to defaults and showing the error in the
 /// footer if the file cannot be read or parsed.
-fn build_app() -> App {
-    match Config::load() {
+fn build_app(config_path: Option<&Path>) -> App {
+    match Config::load(config_path) {
         Ok(config) => App::with_config(config),
         Err(error) => {
             let mut app = App::new();
@@ -271,7 +335,13 @@ mod tests {
 
     #[test]
     fn no_arguments_runs_the_dashboard() {
-        assert_eq!(parse(&[]).expect("no arguments"), Command::Run);
+        assert_eq!(
+            parse(&[]).expect("no arguments"),
+            Command::Run {
+                config: None,
+                spawn_terminal: false,
+            }
+        );
     }
 
     #[test]
@@ -286,8 +356,61 @@ mod tests {
     }
 
     #[test]
+    fn parses_config_path() {
+        let expected = Command::Run {
+            config: Some(PathBuf::from("/tmp/niraboard.toml")),
+            spawn_terminal: false,
+        };
+
+        assert_eq!(
+            parse(&["--config", "/tmp/niraboard.toml"]).expect("long option"),
+            expected
+        );
+        assert_eq!(
+            parse(&["-c", "/tmp/niraboard.toml"]).expect("short option"),
+            expected
+        );
+        assert_eq!(
+            parse(&["--config=/tmp/niraboard.toml"]).expect("inline value"),
+            expected
+        );
+    }
+
+    #[test]
+    fn parses_spawn_terminal_flag() {
+        assert_eq!(
+            parse(&["--spawn-terminal"]).expect("flag"),
+            Command::Run {
+                config: None,
+                spawn_terminal: true,
+            }
+        );
+
+        let expected = Command::Run {
+            config: Some(PathBuf::from("/tmp/niraboard.toml")),
+            spawn_terminal: true,
+        };
+
+        assert_eq!(
+            parse(&["--spawn-terminal", "--config", "/tmp/niraboard.toml"]).expect("flag first"),
+            expected
+        );
+        assert_eq!(
+            parse(&["--config", "/tmp/niraboard.toml", "--spawn-terminal"]).expect("flag last"),
+            expected
+        );
+    }
+
+    #[test]
     fn rejects_unknown_and_extra_arguments() {
         assert!(parse(&["--wat"]).is_err());
         assert!(parse(&["--help", "--version"]).is_err());
+        assert!(parse(&["--config"]).is_err());
+        assert!(parse(&["--config="]).is_err());
+        assert!(parse(&["--config", ""]).is_err());
+        assert!(parse(&["--config", "--help"]).is_err());
+        assert!(parse(&["--config", "/tmp/a.toml", "extra"]).is_err());
+        assert!(parse(&["--spawn-terminal", "--wat"]).is_err());
+        assert!(parse(&["extra"]).is_err());
     }
 }

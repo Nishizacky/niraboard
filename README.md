@@ -71,7 +71,9 @@ brightness/volume step sizes come from an optional TOML configuration file.
 - Rust 1.85 or newer (edition 2024; the CachyOS `rust` package is current).
 - `mold`, selected as the linker on Linux by `.cargo/config.toml`.
 - A true terminal for the dashboard. `--help`, `--version`, and
-  `--print-default-config` work without one.
+  `--print-default-config` work without one. In a graphical session niraboard
+  opens a terminal itself when it is started without one; see
+  [Desktop entry](#desktop-entry).
 
 Runtime integrations are optional. Missing tools are shown as unavailable and
 never crash the application:
@@ -150,6 +152,18 @@ opens it in the configured terminal (for example `terminal=foot -e`). If
 installed file to an absolute path, such as
 `Exec=/home/you/.cargo/bin/niraboard`.
 
+Some launchers, window-manager key bindings, and scripts ignore `Terminal=true`
+and start the binary without a terminal. In a graphical session niraboard then
+opens one itself and runs there. It tries `$TERMINAL` (which may carry options
+such as `foot -e`), then `xdg-terminal-exec`, then the first installed emulator
+from `foot`, `kitty`, `ghostty`, `alacritty`, `wezterm`, `gnome-terminal`,
+`konsole`, `xfce4-terminal`, `tilix`, `terminator`, `x-terminal-emulator`,
+`xterm`, `urxvt`, `st`, or `qterminal`. The relaunched process keeps the
+`--config` path and carries `NIRABOARD_TERMINAL_CHILD=1`, so a terminal that
+fails to provide a TTY cannot cause a relaunch loop. Without
+`$WAYLAND_DISPLAY` or `$DISPLAY` there is nowhere to open a terminal, and the
+dashboard exits with an error instead of guessing.
+
 ## Usage
 
 ### Command-line options
@@ -160,12 +174,25 @@ Usage: niraboard [OPTION]
 Options:
   -h, --help                  Print this help and exit
   -V, --version               Print the version and exit
+  -c, --config <FILE>         Read configuration from FILE
+      --spawn-terminal        Open a terminal emulator for the dashboard when
+                              no terminal is attached
       --print-default-config  Print the default configuration as TOML and exit
 ```
 
+`--config FILE` (or `-c FILE`, `--config=FILE`) reads settings from `FILE`
+instead of the default location. A missing file still means defaults.
+
+`--spawn-terminal` forces the terminal relaunch described under
+[Desktop entry](#desktop-entry), even when only one of stdin/stdout is
+redirected. Without the flag that case is an error, so `niraboard > log` does
+not unexpectedly open a new window.
+
 `--print-default-config` writes the built-in defaults to stdout in the same
 TOML format the configuration file uses. It does not read an existing file and
-does not need a terminal, so it can seed a configuration:
+does not need a terminal, so it can seed a configuration. The document is
+serialized from the same schema that loads the file, so every supported key is
+emitted with its current default value:
 
 ```sh
 mkdir -p ~/.config/niraboard
@@ -208,10 +235,22 @@ the top-right corner of the header.
 | `3 columns` | Three cards per row in a row-major grid |
 
 Cards always appear in the order of the `cards` array in the configuration
-file. The grid layouts wrap that order row by row. If the configured cards do
-not fit on the current screen, the cards that would fall outside are left out
-instead of being squeezed or scrolled; the remaining cards keep their equal
-sizes. This also applies to future cards added in later releases.
+file. The grid layouts wrap that order row by row.
+
+Each layout has its own minimum terminal size. With the eight default cards:
+
+| Layout | Minimum | Bottleneck |
+| --- | --- | --- |
+| `Vertical` | 72×43 | Height for eight card rows |
+| `Horizontal` | 191×8 | Width for eight card columns |
+| `2 columns` | 72×23 | Height for four card rows |
+| `3 columns` | 72×18 | Height for three card rows |
+
+Each extra card row adds five terminal rows. Beyond the 72-column base, every
+extra card column adds 23 terminal columns plus a one-cell gap. Configuring
+fewer cards lowers the requirement. The minimum is checked again as soon as `v`
+changes the layout, and a terminal below it shows a centered hint with the
+required width and height instead of squeezing or clipping the cards.
 
 In the two- and three-column layouts, every card in a column has exactly the
 same width. Leftover terminal cells are absorbed by the gaps rather than making
@@ -226,9 +265,10 @@ convention, not a setting in `niraboard`.
 
 niraboard reads an optional TOML file. The first path that applies is used:
 
-1. `$NIRABOARD_CONFIG` (ignored when empty)
-2. `$XDG_CONFIG_HOME/niraboard/config.toml`
-3. `$HOME/.config/niraboard/config.toml`
+1. `--config FILE` (or `-c FILE`, `--config=FILE`)
+2. `$NIRABOARD_CONFIG` (ignored when empty)
+3. `$XDG_CONFIG_HOME/niraboard/config.toml`
+4. `$HOME/.config/niraboard/config.toml`
 
 A missing file simply means defaults. `examples/config.toml` is a commented
 starting point:
@@ -259,8 +299,19 @@ cards = [
 # Accent for the header, focused borders, buttons, and key hints.
 main = "cyan"
 
-# Normal gauge fill. Warning and critical states stay yellow/red.
+# Normal gauge fill. Warning and critical states use warn / bad below.
 bar = "green"
+
+# Regular values shown in cards.
+text = "gray"
+
+# Labels, hints, and secondary information.
+muted = "dark-gray"
+
+# State colours: connected/healthy, warning, and critical/error.
+ok = "green"
+warn = "yellow"
+bad = "red"
 
 [steps]
 # Percentage changed by one brightness / volume adjustment (1-100).
@@ -349,10 +400,11 @@ src/
 ├── config.rs        TOML loading, colours, startup layout, card order, steps
 ├── event.rs         crossterm event polling
 ├── actions.rs       profile/brightness/audio/nmtui command wrappers
+├── spawn.rs         relaunches the dashboard in a terminal when needed
 ├── ui.rs            Ratatui layout, widgets, hit areas, colours
 └── system/
     ├── mod.rs       Metrics, Monitor, refresh scheduling, identity
-    ├── command.rs   argument-based and interactive process execution
+    ├── command.rs   argument-based, interactive, and detached process execution
     ├── sysfs.rs     small sysfs/procfs helpers
     ├── battery.rs   sysfs battery + UPower fallback
     ├── cpu.rs       /proc/stat delta sampler, model, threads, temperature, frequency
@@ -372,6 +424,11 @@ src/
   the alternate screen on normal exit, on errors, and during unwinding. The same
   guard can suspend niraboard while `nmtui` runs, then resume and clear the
   screen. A panic hook restores the terminal before printing the panic message.
+- **Launcher fallback**: when both streams are not terminals and a display
+  server is available, `spawn` re-executes the current binary in a terminal
+  emulator and exits; it never uses a shell. The child gets its own process
+  group so it survives the caller closing its terminal, and the
+  `NIRABOARD_TERMINAL_CHILD=1` environment variable prevents relaunch loops.
 - **Immediate-mode rendering**: every draw describes the whole screen from
   `App` state. Widgets are cheap values constructed per frame; there is no
   retained widget tree to synchronise.
@@ -397,10 +454,12 @@ profiles. Making that action non-blocking is listed as a future improvement.
 ## Known limitations
 
 - Linux-only; the sysfs/procfs paths are intentionally not portable.
-- The interface has a hard minimum of 72×22. The default `Vertical` layout looks
-  best at 80×30 or larger; the grid layouts fit shorter terminals. Cards that
-  cannot fit are omitted rather than clipped, and at very small sizes the screen
-  shows a centered size hint.
+- The minimum terminal size depends on the layout and the number of configured
+  cards. With all eight default cards it is 72×43 for `Vertical`, 191×8 for
+  `Horizontal`, 72×23 for two columns, and 72×18 for three columns. Below that,
+  the screen shows a centered hint with the required dimensions. `Vertical`
+  needs the most height, while `Horizontal` trades height for width; the grid
+  layouts fit shorter terminals.
 - Battery power draw depends on firmware. Many laptops report `0` while on AC,
   not charging, or under a charge threshold, in which case `niraboard` shows
   `—`.

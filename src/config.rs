@@ -6,12 +6,17 @@ use std::str::FromStr;
 
 use anyhow::{Context, Result, bail};
 use ratatui::style::Color;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::app::{Card, LayoutMode};
 
 const DEFAULT_MAIN_COLOR: Color = Color::Cyan;
 const DEFAULT_BAR_COLOR: Color = Color::Green;
+const DEFAULT_TEXT_COLOR: Color = Color::Gray;
+const DEFAULT_MUTED_COLOR: Color = Color::DarkGray;
+const DEFAULT_OK_COLOR: Color = Color::Green;
+const DEFAULT_WARN_COLOR: Color = Color::Yellow;
+const DEFAULT_BAD_COLOR: Color = Color::Red;
 const DEFAULT_STEP: u8 = 5;
 const MIN_STEP: u8 = 1;
 const MAX_STEP: u8 = 100;
@@ -19,12 +24,19 @@ const MAX_STEP: u8 = 100;
 /// Colours used by the dashboard.
 ///
 /// `main` is the accent colour used for the header, focus highlights, buttons,
-/// and key hints. `bar` is the normal fill colour of gauges; warning and
-/// critical states keep their yellow/red colours.
+/// and key hints, while `bar` is the normal fill colour of gauges. `text` is
+/// used for regular values and `muted` for labels and secondary hints. `ok`,
+/// `warn`, and `bad` colour the state indicators (connected, warning, and
+/// critical respectively).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Colors {
     pub main: Color,
     pub bar: Color,
+    pub text: Color,
+    pub muted: Color,
+    pub ok: Color,
+    pub warn: Color,
+    pub bad: Color,
 }
 
 impl Default for Colors {
@@ -32,6 +44,11 @@ impl Default for Colors {
         Self {
             main: DEFAULT_MAIN_COLOR,
             bar: DEFAULT_BAR_COLOR,
+            text: DEFAULT_TEXT_COLOR,
+            muted: DEFAULT_MUTED_COLOR,
+            ok: DEFAULT_OK_COLOR,
+            warn: DEFAULT_WARN_COLOR,
+            bad: DEFAULT_BAD_COLOR,
         }
     }
 }
@@ -86,11 +103,12 @@ impl Default for Config {
 impl Config {
     /// Load the configuration from disk. A missing file means defaults.
     ///
-    /// The path is `$NIRABOARD_CONFIG` when set, otherwise
-    /// `$XDG_CONFIG_HOME/niraboard/config.toml`, otherwise
+    /// `override_path` comes from `--config` and takes precedence. Otherwise the
+    /// path is `$NIRABOARD_CONFIG` when set, then
+    /// `$XDG_CONFIG_HOME/niraboard/config.toml`, then
     /// `$HOME/.config/niraboard/config.toml`.
-    pub fn load() -> Result<Self> {
-        let Some(path) = path() else {
+    pub fn load(override_path: Option<&Path>) -> Result<Self> {
+        let Some(path) = override_path.map(Path::to_path_buf).or_else(path) else {
             return Ok(Self::default());
         };
 
@@ -120,6 +138,21 @@ impl Config {
         if let Some(value) = raw.colors.bar.as_deref() {
             config.colors.bar = parse_color(value, "colors.bar")?;
         }
+        if let Some(value) = raw.colors.text.as_deref() {
+            config.colors.text = parse_color(value, "colors.text")?;
+        }
+        if let Some(value) = raw.colors.muted.as_deref() {
+            config.colors.muted = parse_color(value, "colors.muted")?;
+        }
+        if let Some(value) = raw.colors.ok.as_deref() {
+            config.colors.ok = parse_color(value, "colors.ok")?;
+        }
+        if let Some(value) = raw.colors.warn.as_deref() {
+            config.colors.warn = parse_color(value, "colors.warn")?;
+        }
+        if let Some(value) = raw.colors.bad.as_deref() {
+            config.colors.bad = parse_color(value, "colors.bad")?;
+        }
 
         if let Some(value) = raw.layout.as_deref() {
             config.layout = LayoutMode::from_name(value)
@@ -142,35 +175,12 @@ impl Config {
 
     /// Render this configuration as TOML.
     ///
-    /// Used by `--print-default-config`; every value is taken from the live
-    /// defaults, so the output cannot drift from what a missing file produces.
-    pub fn to_toml(&self) -> String {
-        let cards = self
-            .cards
-            .iter()
-            .map(|card| format!("    \"{}\",\n", card.name()))
-            .collect::<String>();
-
-        format!(
-            "layout = \"{}\"\n\
-             \n\
-             cards = [\n\
-             {cards}\
-             ]\n\
-             \n\
-             [colors]\n\
-             main = \"{}\"\n\
-             bar = \"{}\"\n\
-             \n\
-             [steps]\n\
-             brightness = {}\n\
-             volume = {}\n",
-            self.layout.name(),
-            self.colors.main,
-            self.colors.bar,
-            self.steps.brightness,
-            self.steps.volume,
-        )
+    /// Used by `--print-default-config`. The document is serialized from the
+    /// same structure that [`Config::parse`] deserializes, so the output cannot
+    /// drift from what a missing file produces.
+    pub fn to_toml(&self) -> Result<String> {
+        toml::to_string_pretty(&RawConfig::from(self))
+            .context("failed to render configuration as TOML")
     }
 }
 
@@ -223,25 +233,58 @@ fn parse_cards(names: &[String]) -> Result<Vec<Card>> {
     Ok(cards)
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
+    layout: Option<String>,
+    cards: Option<Vec<String>>,
     #[serde(default)]
     colors: RawColors,
-    layout: Option<String>,
     #[serde(default)]
     steps: RawSteps,
-    cards: Option<Vec<String>>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+impl From<&Config> for RawConfig {
+    fn from(config: &Config) -> Self {
+        Self {
+            layout: Some(config.layout.name().to_owned()),
+            cards: Some(
+                config
+                    .cards
+                    .iter()
+                    .map(|card| card.name().to_owned())
+                    .collect(),
+            ),
+            colors: RawColors {
+                main: Some(config.colors.main.to_string()),
+                bar: Some(config.colors.bar.to_string()),
+                text: Some(config.colors.text.to_string()),
+                muted: Some(config.colors.muted.to_string()),
+                ok: Some(config.colors.ok.to_string()),
+                warn: Some(config.colors.warn.to_string()),
+                bad: Some(config.colors.bad.to_string()),
+            },
+            steps: RawSteps {
+                brightness: Some(config.steps.brightness),
+                volume: Some(config.steps.volume),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawColors {
     main: Option<String>,
     bar: Option<String>,
+    text: Option<String>,
+    muted: Option<String>,
+    ok: Option<String>,
+    warn: Option<String>,
+    bad: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawSteps {
     brightness: Option<u8>,
@@ -254,12 +297,40 @@ mod tests {
 
     #[test]
     fn default_config_renders_as_parseable_toml() {
-        let text = Config::default().to_toml();
+        let text = Config::default().to_toml().expect("rendered config");
 
         assert_eq!(
             Config::parse(&text).expect("rendered config"),
             Config::default()
         );
+    }
+
+    #[test]
+    fn custom_config_round_trips_through_toml() {
+        let mut config = Config::default();
+        config.colors.main = Color::Rgb(0xff, 0x88, 0x00);
+        config.colors.bar = Color::Indexed(42);
+        config.colors.text = Color::LightBlue;
+        config.colors.muted = Color::DarkGray;
+        config.colors.ok = Color::LightGreen;
+        config.colors.warn = Color::LightYellow;
+        config.colors.bad = Color::LightRed;
+        config.layout = LayoutMode::ThreeColumns;
+        config.steps.brightness = 10;
+        config.steps.volume = 1;
+        config.cards = vec![Card::Audio, Card::Cpu, Card::Network];
+
+        let text = config.to_toml().expect("rendered config");
+
+        assert_eq!(Config::parse(&text).expect("rendered config"), config);
+    }
+
+    #[test]
+    fn example_config_matches_defaults() {
+        let config =
+            Config::parse(include_str!("../examples/config.toml")).expect("example config");
+
+        assert_eq!(config, Config::default());
     }
 
     #[test]
@@ -271,6 +342,19 @@ mod tests {
     }
 
     #[test]
+    fn loads_config_from_explicit_path() {
+        let path =
+            std::env::temp_dir().join(format!("niraboard-config-{}.toml", std::process::id()));
+        fs::write(&path, "layout = \"3-columns\"\n[steps]\nvolume = 2\n").expect("write config");
+
+        let config = Config::load(Some(&path)).expect("loaded config");
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(config.layout, LayoutMode::ThreeColumns);
+        assert_eq!(config.steps.volume, 2);
+    }
+
+    #[test]
     fn parses_colors_layout_and_steps() {
         let config = Config::parse(
             r##"
@@ -279,6 +363,11 @@ mod tests {
                 [colors]
                 main = "#ff8800"
                 bar = "light-blue"
+                text = "white"
+                muted = "dark-gray"
+                ok = "light-green"
+                warn = "light-yellow"
+                bad = "light-red"
 
                 [steps]
                 brightness = 10
@@ -289,6 +378,11 @@ mod tests {
 
         assert_eq!(config.colors.main, Color::Rgb(0xff, 0x88, 0x00));
         assert_eq!(config.colors.bar, Color::LightBlue);
+        assert_eq!(config.colors.text, Color::White);
+        assert_eq!(config.colors.muted, Color::DarkGray);
+        assert_eq!(config.colors.ok, Color::LightGreen);
+        assert_eq!(config.colors.warn, Color::LightYellow);
+        assert_eq!(config.colors.bad, Color::LightRed);
         assert_eq!(config.layout, LayoutMode::TwoColumns);
         assert_eq!(config.steps.brightness, 10);
         assert_eq!(config.steps.volume, 2);
