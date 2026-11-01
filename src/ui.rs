@@ -1,14 +1,12 @@
-use std::time::Instant;
-
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Gauge, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Gauge, Paragraph, Wrap};
 
 use crate::app::{App, Card, Focus, LayoutMode, StatusLevel};
 use crate::config::{Colors, Steps};
-use crate::notifications::{Entry, Tab};
+use crate::notifications::{Center, Tab, Urgency};
 use crate::system::{Battery, ChargeState, PowerProfile};
 
 /// Smallest terminal width that keeps the header, footer, and a single card
@@ -38,6 +36,7 @@ pub struct HitAreas {
     wifi: Option<Rect>,
     notification_button: Option<Rect>,
     notification_tabs: Vec<(Rect, Tab)>,
+    notification_rows: Vec<(Rect, usize)>,
     notification_window: Option<Rect>,
     steps: Steps,
 }
@@ -53,6 +52,7 @@ pub enum ClickAction {
     OpenNetwork,
     ToggleNotifications,
     SelectNotificationTab(Tab),
+    SelectNotification(usize),
 }
 
 impl HitAreas {
@@ -68,6 +68,13 @@ impl HitAreas {
             .find(|(rect, _)| rect.contains(position))
         {
             return Some(ClickAction::SelectNotificationTab(*tab));
+        }
+        if let Some((_, index)) = self
+            .notification_rows
+            .iter()
+            .find(|(rect, _)| rect.contains(position))
+        {
+            return Some(ClickAction::SelectNotification(*index));
         }
         if contains(self.layout, position) {
             return Some(ClickAction::CycleLayout);
@@ -387,22 +394,9 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitAreas, co
         columns[0],
     );
 
-    let unread = app.notifications.unread();
     let (label, style) = if app.notifications.is_open() {
         (
             "[n] close".to_owned(),
-            Style::default()
-                .fg(colors.main)
-                .add_modifier(Modifier::BOLD),
-        )
-    } else if unread > 0 {
-        let count = if unread > 99 {
-            "99+".to_owned()
-        } else {
-            unread.to_string()
-        };
-        (
-            format!("[n] notifications ({count})"),
             Style::default()
                 .fg(colors.main)
                 .add_modifier(Modifier::BOLD),
@@ -421,7 +415,6 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitAreas, co
 
     let (text, color) = match app.status_text() {
         Some((text, StatusLevel::Info)) => (text, colors.ok),
-        Some((text, StatusLevel::Warn)) => (text, colors.warn),
         Some((text, StatusLevel::Error)) => (text, colors.bad),
         None => ("ready · click cards or buttons", colors.muted),
     };
@@ -1115,13 +1108,16 @@ fn draw_notifications(
     frame.render_widget(Clear, popup);
 
     let center = &app.notifications;
-    let total = center.filtered_count();
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(colors.main))
         .title(Span::styled(
-            format!(" Notifications · {total} "),
+            format!(
+                " mako · {} active · {} history ",
+                center.active_count(),
+                center.history_count()
+            ),
             Style::default()
                 .fg(colors.main)
                 .add_modifier(Modifier::BOLD),
@@ -1143,14 +1139,22 @@ fn draw_notifications(
     draw_notification_tabs(frame, rows[0], app, hits, colors);
 
     let list_area = rows[1];
-    let filtered: Vec<&Entry> = center.filtered().collect();
     let visible = list_area.height as usize;
+    let entries = center.entries();
 
-    if filtered.is_empty() {
-        let message = if total == 0 {
-            "No notifications yet"
-        } else {
-            "No notifications in this tab"
+    if let Some(error) = center.error() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                error.to_owned(),
+                Style::default().fg(colors.bad),
+            )))
+            .wrap(Wrap { trim: true }),
+            list_area,
+        );
+    } else if entries.is_empty() {
+        let message = match center.tab() {
+            Tab::Active => "No active notifications",
+            Tab::History => "No notification history",
         };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -1161,36 +1165,82 @@ fn draw_notifications(
             list_area,
         );
     } else {
-        let start = center.offset().min(filtered.len().saturating_sub(1));
-        let now = Instant::now();
-        let lines: Vec<Line> = filtered
+        let start = selection_offset(entries.len(), center.selected(), visible);
+        let text_width = list_area.width.saturating_sub(2);
+        let lines: Vec<Line> = entries
             .iter()
+            .enumerate()
             .skip(start)
             .take(visible)
-            .map(|entry| {
-                let age = entry.age_label(now);
-                let (marker, color) = match entry.level {
-                    StatusLevel::Info => ("●", colors.ok),
-                    StatusLevel::Warn => ("!", colors.warn),
-                    StatusLevel::Error => ("✕", colors.bad),
+            .map(|(index, entry)| {
+                let selected = index == center.selected();
+                let (default_marker, urgency_color) = match entry.urgency {
+                    Urgency::Low => ("·", colors.muted),
+                    Urgency::Normal => ("●", colors.main),
+                    Urgency::Critical => ("!", colors.bad),
                 };
-                let body = fit(&entry.text, list_area.width.saturating_sub(8));
+                let marker = if selected { "▸" } else { default_marker };
+
+                let mut text = String::new();
+                if let Some(app_name) = entry.app.as_deref() {
+                    text.push_str(app_name);
+                    text.push_str(": ");
+                }
+                text.push_str(&entry.summary);
+                if let Some(body) = entry.body.as_deref() {
+                    text.push_str(" — ");
+                    text.push_str(body);
+                }
+
+                let text_style = if selected {
+                    Style::default()
+                        .fg(colors.main)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(colors.text)
+                };
                 Line::from(vec![
-                    Span::styled(format!("{age:>4}"), Style::default().fg(colors.muted)),
-                    Span::raw("  "),
                     Span::styled(
-                        marker,
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                        format!("{marker} "),
+                        Style::default()
+                            .fg(if selected { colors.main } else { urgency_color })
+                            .add_modifier(Modifier::BOLD),
                     ),
-                    Span::raw(" "),
-                    Span::styled(body, Style::default().fg(colors.text)),
+                    Span::styled(fit(&text, text_width), text_style),
                 ])
             })
             .collect();
         frame.render_widget(Paragraph::new(lines), list_area);
+
+        for (row, (index, _)) in entries
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible)
+            .enumerate()
+        {
+            let rect = Rect::new(
+                list_area.x,
+                list_area.y.saturating_add(row as u16),
+                list_area.width,
+                1,
+            );
+            hits.notification_rows.push((rect, index));
+        }
     }
 
-    draw_notification_hint(frame, rows[2], &filtered, center.offset(), visible, colors);
+    draw_notification_hint(frame, rows[2], center, colors);
+}
+
+/// First entry shown so the selected one stays inside the visible window.
+fn selection_offset(len: usize, selected: usize, visible: usize) -> usize {
+    if visible == 0 || len <= visible {
+        return 0;
+    }
+
+    selected
+        .saturating_sub(visible / 2)
+        .min(len.saturating_sub(visible))
 }
 
 fn draw_notification_tabs(
@@ -1228,33 +1278,31 @@ fn draw_notification_tabs(
     }
 }
 
-fn draw_notification_hint(
-    frame: &mut Frame,
-    area: Rect,
-    filtered: &[&Entry],
-    offset: usize,
-    visible: usize,
-    colors: Colors,
-) {
+fn draw_notification_hint(frame: &mut Frame, area: Rect, center: &Center, colors: Colors) {
     if area.is_empty() {
         return;
     }
 
     let hint = Line::from(vec![
-        key("tab", colors),
-        Span::raw(" switch  "),
-        key("j/k", colors),
-        Span::raw(" scroll  "),
+        key("↵", colors),
+        Span::raw(" invoke  "),
+        key("d", colors),
+        Span::raw(" dismiss  "),
+        key("D", colors),
+        Span::raw(" all  "),
+        key("o", colors),
+        Span::raw(" restore  "),
+        key("r", colors),
+        Span::raw(" refresh  "),
         key("n/Esc", colors),
         Span::raw(" close"),
     ]);
 
-    let start = offset.min(filtered.len().saturating_sub(1));
-    let position = if filtered.is_empty() {
+    let total = center.entries().len();
+    let position = if total == 0 {
         "0 / 0".to_owned()
     } else {
-        let shown = visible.min(filtered.len() - start);
-        format!("{}-{} / {}", start + 1, start + shown, filtered.len())
+        format!("{} / {total}", center.selected() + 1)
     };
     let columns = Layout::horizontal([
         Constraint::Fill(1),
@@ -1392,10 +1440,32 @@ fn fit(text: &str, width: u16) -> String {
 mod tests {
     use super::*;
     use crate::app::App;
-    use crate::notifications::{Source, Tab};
+    use crate::notifications::{DesktopNotification, Urgency};
     use crate::system::{Audio, Battery, Brightness, ChargeState, Disk};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    fn sample(id: u32, app_name: &str, summary: &str, body: Option<&str>) -> DesktopNotification {
+        DesktopNotification {
+            id,
+            app: Some(app_name.to_owned()),
+            summary: summary.to_owned(),
+            body: body.map(str::to_owned),
+            urgency: Urgency::Normal,
+            actions: Vec::new(),
+        }
+    }
+
+    fn open_with(
+        app: &mut App,
+        active: Vec<DesktopNotification>,
+        history: Vec<DesktopNotification>,
+    ) {
+        // Bypass `makoctl`: tests only exercise the rendering of a populated
+        // stack, not the daemon connection.
+        app.notifications.force_open();
+        app.notifications.set_entries(active, history);
+    }
 
     fn render(width: u16, height: u16) -> (String, HitAreas) {
         render_layout(width, height, LayoutMode::Vertical)
@@ -1684,71 +1754,99 @@ mod tests {
     #[test]
     fn renders_notification_window_with_tabs_and_entries() {
         let mut app = test_app();
-        app.notifications.push(
-            "Battery low: 24%".to_owned(),
-            StatusLevel::Warn,
-            Source::System,
-            "battery-low",
+        open_with(
+            &mut app,
+            vec![sample(1, "Telegram", "Alice", Some("hello"))],
+            vec![sample(2, "Battery", "Battery low: 24%", None)],
         );
-        app.notifications.push(
-            "Power profile: balanced".to_owned(),
-            StatusLevel::Info,
-            Source::Control,
-            "power-profile",
-        );
-        app.notifications.toggle();
 
         let (screen, hits) = render_app(&app, 120, 60);
 
         for label in [
-            "Notifications",
-            "All",
-            "System",
-            "Controls",
-            "Issues",
-            "Battery low: 24%",
-            "Power profile: balanced",
-            "n/Esc",
+            "mako",
+            "1 active · 1 history",
+            "Active",
+            "History",
+            "Telegram: Alice — hello",
+            "invoke",
+            "dismiss",
+            "restore",
+            "close",
         ] {
             assert!(screen.contains(label), "missing {label} in\n{screen}");
         }
 
         assert!(hits.notification_window.is_some());
         assert_eq!(hits.notification_tabs.len(), Tab::ALL.len());
+        assert_eq!(hits.notification_rows.len(), 1);
     }
 
     #[test]
-    fn notification_tabs_are_clickable() {
+    fn history_tab_renders_history_entries() {
         let mut app = test_app();
-        app.notifications.push(
-            "Battery low: 24%".to_owned(),
-            StatusLevel::Warn,
-            Source::System,
-            "battery-low",
+        open_with(
+            &mut app,
+            vec![sample(1, "Telegram", "Alice", Some("hello"))],
+            vec![sample(2, "Battery", "Battery low: 24%", None)],
         );
-        app.notifications.toggle();
+        app.notifications.select_tab(Tab::History);
+
+        let (screen, hits) = render_app(&app, 120, 60);
+
+        assert!(screen.contains("Battery: Battery low: 24%"));
+        assert!(!screen.contains("Telegram: Alice"));
+        assert_eq!(hits.notification_rows.len(), 1);
+    }
+
+    #[test]
+    fn notification_tabs_and_rows_are_clickable() {
+        let mut app = test_app();
+        open_with(
+            &mut app,
+            vec![sample(1, "Telegram", "Alice", Some("hello"))],
+            vec![sample(2, "Battery", "Battery low: 24%", None)],
+        );
 
         let (_, hits) = render_app(&app, 120, 60);
+
         let (rect, tab) = hits
             .notification_tabs
             .iter()
-            .find(|(_, tab)| *tab == Tab::System)
+            .find(|(_, tab)| *tab == Tab::History)
             .copied()
-            .expect("system tab");
-
+            .expect("history tab");
         assert_eq!(
             hits.action_at(rect.x, rect.y),
             Some(ClickAction::SelectNotificationTab(tab))
+        );
+
+        let (rect, index) = hits.notification_rows[0];
+        assert_eq!(
+            hits.action_at(rect.x, rect.y),
+            Some(ClickAction::SelectNotification(index))
         );
     }
 
     #[test]
     fn empty_notification_window_shows_a_hint() {
         let mut app = test_app();
-        app.notifications.toggle();
+        open_with(&mut app, Vec::new(), Vec::new());
 
         let (screen, _) = render_app(&app, 120, 60);
-        assert!(screen.contains("No notifications yet"));
+        assert!(screen.contains("No active notifications"));
+        assert!(screen.contains("0 / 0"));
+    }
+
+    #[test]
+    fn notification_error_is_shown_in_the_window() {
+        let mut app = test_app();
+        app.notifications.force_open();
+        // No mako daemon is running in the test environment, so forcing a
+        // refresh records the failure instead of panicking.
+        app.notifications.refresh(true);
+
+        let (screen, _) = render_app(&app, 120, 60);
+        assert!(screen.contains("makoctl"));
     }
 
     #[test]

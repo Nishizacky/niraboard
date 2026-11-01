@@ -1,14 +1,15 @@
 # niraboard
 
-A compact, keyboard-first laptop power dashboard for the terminal.
+A compact, keyboard-first control panel for the terminal — built for **niri**
+as an on-demand replacement for an always-visible bar like Waybar.
 
 `niraboard` is a small Ratatui/Crossterm TUI for Linux laptops, developed on
 CachyOS/Arch. It shows battery, CPU, memory, root filesystem, Wi-Fi, local and
 public IP addresses, power profile, brightness, and PipeWire volume on one
 screen, and lets you change the power profile, brightness, volume, and mute
-state without leaving the terminal. Pressing `n` opens an in-app notification
-window with a tabbed history of system transitions, actions, and failures.
-Clicking the network card (or pressing `w`)
+state without leaving the terminal. Pressing `n` opens a mako notification
+browser with `Active` and `History` tabs, where you can invoke, dismiss, and
+restore mako's notifications. Clicking the network card (or pressing `w`)
 opens NetworkManager's `nmtui` for connection changes; the network data is
 refreshed when it exits.
 
@@ -16,6 +17,45 @@ It is an on-demand utility: there is no daemon, no background service, and no
 polling when it is not running. The header clock and date, colours, the startup
 layout, card order, and the brightness/volume step sizes come from an optional
 TOML configuration file.
+
+## The idea: a bar you call, not a bar you keep
+
+niraboard was designed around niri and its scrollable tiling workflow, where a
+permanently visible status bar mostly costs screen space. A tiling desktop does
+not need a strip of pixels that is always there; it needs a control panel that
+appears the moment you ask for it and disappears when you are done.
+
+Bind niraboard to a key. One keystroke gives you a single screen with the whole
+machine on it — battery, CPU, memory, disk, network, IP addresses, power
+profile, brightness, and audio. Change what you need in place, press `q`, and
+the workspace is yours again. Between those two moments niraboard uses no
+memory, no CPU, and no battery.
+
+That trade-off is the point:
+
+- **On demand, not always on.** No daemon, no background service, no idle
+  polling, no process to babysit. Start it, use it, quit it.
+- **A control panel, not a readout.** A bar tells you the volume; niraboard
+  lets you change it, mute it, switch the power profile, adjust the backlight,
+  and open `nmtui` from the same screen.
+- **One screen, whole machine.** Everything relevant is visible at once, so you
+  look, act, and leave instead of hovering over individual modules.
+- **A normal window.** It is a plain terminal application, so niri decides
+  where it goes. Make it floating in your niri window rules and it behaves like
+  a quick utility overlay; tile it and it is just another workspace window.
+
+In niri, a single bind is enough:
+
+```kdl
+binds {
+    Mod+Shift+N { spawn "niraboard"; }
+}
+```
+
+niraboard opens a terminal for itself when it is started from a graphical
+session without one, so the bind above works as-is. Pass
+`--spawn-terminal` to force that behaviour. See
+[Desktop entry](#desktop-entry) for the launcher setup.
 
 ```text
  2026-10-31 14:05  NIRABOARD  ThinkPad L580  ·  laptop power      Vertical · 2s tick
@@ -71,6 +111,9 @@ TOML configuration file.
 ## Requirements
 
 - Linux; the sysfs/procfs paths are Linux-specific (developed on CachyOS/Arch).
+- Target environment: niri on Wayland. Any compositor works — it is just a
+  terminal application — but the on-demand, bar-free workflow is designed
+  around a scrollable tiling compositor.
 - Rust 1.88 or newer (edition 2024; the CachyOS `rust` package is current).
 - `mold`, selected as the linker on Linux by `.cargo/config.toml`.
 - A true terminal for the dashboard. `--help`, `--version`, and
@@ -97,12 +140,13 @@ never crash the application:
 | `powerprofilesctl` (power-profiles-daemon) | Changing power profile |
 | `busctl` (systemd) | Cheap read of the active profile property |
 | `upower` | Battery fallback when no sysfs battery exists |
+| `makoctl` (mako) | Reading and acting on mako's notification stack |
 
 On Arch/CachyOS, the usual package set is:
 
 ```sh
 sudo pacman -S --needed rust cargo mold brightnessctl networkmanager \
-  power-profiles-daemon pipewire wireplumber upower iproute2 curl
+  power-profiles-daemon pipewire wireplumber upower iproute2 curl mako
 ```
 
 `powerprofilesctl` and `networkmanager` may already be installed and running.
@@ -209,7 +253,7 @@ niraboard --print-default-config > ~/.config/niraboard/config.toml
 | `tab` / `shift+tab` | Move focus between the power, brightness, and audio cards |
 | `←` / `→` or `h` / `l` | Adjust the focused card: cycle profile, brightness, or volume by the configured step |
 | `m` | Toggle mute |
-| `n` | Open or close the notification window |
+| `n` | Open or close the mako notification browser |
 | `v` | Cycle the card layout (see [Layouts](#layouts)) |
 | `w` | Open `nmtui` to manage Wi-Fi connections |
 | `1` / `2` / `3` | Set `power-saver`, `balanced`, or `performance` directly |
@@ -225,30 +269,44 @@ the network data is refreshed when it exits. Clicking the layout name in the
 top-right corner (or pressing `v`) changes the arrangement. Keyboard operation
 never depends on the mouse.
 
-While the notification window is open, `tab` / `shift+tab` or `h` / `l` switch
-tabs, `j` / `k` scroll one row, `PageUp` / `PageDown` scroll five, `Home` / `End`
-jump to the ends, and `Esc` or `n` closes it. Dashboard shortcuts are ignored
-behind the window.
+While the mako window is open, `tab` / `shift+tab` or `h` / `l` switch between
+`Active` and `History`, `j` / `k` move the selection, `PageUp` / `PageDown`
+move it five rows, and `Home` / `End` jump to the ends. `Enter` invokes the
+default action of the selected active notification, `d` dismisses it, `D`
+dismisses every active notification, `o` restores the most recently dismissed
+one, and `r` refreshes the list immediately. `Esc` or `n` closes the window.
+Dashboard shortcuts are ignored behind the window. Clicking a tab selects it,
+clicking a row selects that notification, and clicking outside closes the
+window.
 
 ### Notifications
 
-`n` or the button at the right end of the footer opens a centered, tabbed
-history of what niraboard has done and seen. The button shows the number of
-unread entries; opening or closing the window marks them read.
+`n` or the button at the right end of the footer opens a browser for the
+running [mako](https://github.com/emersion/mako) notification daemon. niraboard
+does not receive notifications itself and does not keep a second copy of the
+stack: mako remains the owner, and niraboard is only a client for it.
 
 | Tab | Contents |
 | --- | --- |
-| `All` | Everything, newest first |
-| `System` | Battery, AC, Wi-Fi, and CPU temperature transitions |
-| `Controls` | Power profile, brightness, volume, mute, layout, refresh, `nmtui`, and their failures |
-| `Issues` | Warnings and errors from every source |
+| `Active` | Notifications mako is currently showing |
+| `History` | Notifications mako has already dismissed |
 
-Automatic entries are emitted only when state changes: the battery crossing
-25% or 10%, AC connecting or disconnecting, Wi-Fi connecting or disconnecting,
-and the CPU temperature crossing 85 °C. Repeating the same control within five
-seconds updates one row instead of adding another. The newest 200 entries are
-kept in memory; history is not written to disk and disappears when niraboard
-exits. Clicking a tab selects it, and clicking outside the window closes it.
+The window is fetched lazily. Nothing is read at startup or while the window is
+closed. Opening the window runs `makoctl list -j` and `makoctl history -j`; it
+is refreshed again every 10 seconds while open and immediately after an action
+or an explicit `r`.
+
+Actions map directly to mako's own IPC: `makoctl invoke -n ID`,
+`makoctl dismiss -n ID`, `makoctl dismiss -a`, and `makoctl restore`. Invoking
+and dismissing by id is only available on the `Active` tab, because mako's
+history entries are no longer actionable.
+
+Notification text is external input. Control characters, including terminal
+escape sequences, are removed and newlines/tabs are flattened before rendering,
+so a notification cannot disturb the layout. If mako is not running or
+`makoctl` is missing, the window shows the error instead of failing the
+dashboard. Install and run mako separately; niraboard never starts a
+notification daemon.
 
 ### Layouts
 
@@ -356,9 +414,10 @@ volume = 5
 ```
 
 Colours accept names (`cyan`, `light-blue`, `red`, ...), an ANSI index
-(`0`-`255`), or a hexadecimal value (`"#4fc3f7"`). Unknown keys, invalid
-colours, unknown or duplicate card names, and steps outside 1-100 are reported
-in the footer; niraboard then starts with defaults instead of exiting.
+(`0`-`255`), or a hexadecimal value (`#4fc3f7`). Unknown keys, invalid colours,
+unknown or duplicate card names, and steps outside 1-100 are printed to stderr
+before the dashboard starts; niraboard then runs with defaults instead of
+exiting.
 
 The `[clock]` section controls the date and time shown to the left of the
 header title. Set `enabled = false` to hide it, or change `format` to any
@@ -421,6 +480,7 @@ The event loop wakes every 2 seconds. Data collection is deliberately split:
 | Global IP | 300 s | `curl https://api.ipify.org` |
 | Power profile | 30 s | `busctl` property read |
 | UPower fallback | 30 s, only when no sysfs battery | `upower -e` / `upower -i` |
+| mako notifications | on open, then every 10 s while open | `makoctl list -j` / `history -j` |
 
 CPU utilisation is always a delta between the previous and current
 `/proc/stat` samples. The first sample therefore shows `—`, not a misleading
@@ -449,7 +509,7 @@ src/
 ├── config.rs        TOML loading, colours, clock, layout, card order, steps
 ├── event.rs         crossterm event polling
 ├── actions.rs       profile/brightness/audio/nmtui command wrappers
-├── notifications.rs in-memory notification history and window state
+├── notifications.rs mako stack client, tabs, selection, invoke/dismiss actions
 ├── spawn.rs         relaunches the dashboard in a terminal when needed
 ├── ui.rs            Ratatui layout, widgets, hit areas, colours
 └── system/
@@ -487,11 +547,12 @@ src/
   them in `App`; mouse events call `HitAreas::action_at`, which maps coordinates
   to a small `ClickAction` enum. Rendering and input therefore share one layout
   definition.
-- **Notifications**: `notifications::Center` owns the history, selected tab,
-  unread watermark, and scroll offset. `App` records explicit status messages
-  and transitions found by comparing `Metrics` snapshots; the window renders
-  that state without retaining widgets. Relative timestamps are refreshed by
-  letting the window request a redraw on every tick while it is open.
+- **Notifications**: `notifications::Center` is a client for mako, not a
+  notification daemon or history store. It owns the open state, selected tab,
+  selection, cached `makoctl` output, last refresh time, and any error. `App`
+  keeps only a short-lived footer status for control actions. The window
+  refreshes the stack when opened, every 10 seconds while visible, and on
+  demand, so no work happens while it is closed.
 - **Dirty redraw**: `App::tick` and `App::handle_event` return whether anything
   visible changed. `main` draws only when that flag is set. `Metrics` holds
   `Option`s for unavailable sources and derives `PartialEq`, so the same typed
@@ -540,8 +601,9 @@ profiles. Making that action non-blocking is listed as a future improvement.
 - CPU temperature covers hwmon `coretemp`/`k10temp`/`zenpower` and common
   thermal zones. There is no `sensors` fallback yet.
 - No history graphs or battery time estimate.
-- Notifications are in-app only: desktop notification daemons such as mako,
-  dunst, or swaync are not read, and the history is not persisted across runs.
+- Notifications are mako-only. A running mako daemon and `makoctl` are required
+  for that window; dunst and swaync are not supported. The stack is read only
+  while the window is open and is never persisted by niraboard.
 - Terminal mouse capture can interfere with text selection unless `Shift` is
   held.
 
@@ -553,8 +615,7 @@ profiles. Making that action non-blocking is listed as a future improvement.
 - Cache the last global IP across runs so a temporarily offline machine still
   shows the previous value.
 - Sparklines for CPU, memory, and battery power history.
-- Read desktop notifications from a notification daemon and persist the
-  notification history between runs.
+- Choose among a notification's named actions instead of only its default.
 - Battery time-to-empty and charge-threshold controls (with explicit policy
   checks).
 - Per-core CPU view and a compact process list.

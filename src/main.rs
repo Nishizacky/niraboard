@@ -90,8 +90,12 @@ fn run_dashboard(config_path: Option<PathBuf>, spawn_terminal: bool) -> Result<(
 
     install_panic_hook();
 
+    // Configuration is loaded before the terminal is touched so that a bad
+    // file only prints to stderr and never interrupts the TUI.
+    let app = build_app(config_path.as_deref());
+
     let mut session = TerminalSession::start()?;
-    let result = run(&mut session, config_path.as_deref());
+    let result = run(&mut session, app);
     let restore_result = session.finish();
 
     result?;
@@ -177,8 +181,7 @@ fn parse_config_path(path: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(path))
 }
 
-fn run(session: &mut TerminalSession, config_path: Option<&Path>) -> Result<()> {
-    let mut app = build_app(config_path);
+fn run(session: &mut TerminalSession, mut app: App) -> Result<()> {
     app.refresh_all();
 
     let mut dirty = true;
@@ -226,15 +229,14 @@ fn run(session: &mut TerminalSession, config_path: Option<&Path>) -> Result<()> 
     Ok(())
 }
 
-/// Load configuration, falling back to defaults and showing the error in the
-/// footer if the file cannot be read or parsed.
+/// Load configuration, falling back to defaults. A bad file is reported on
+/// stderr only, since configuration is loaded before the terminal starts.
 fn build_app(config_path: Option<&Path>) -> App {
     match Config::load(config_path) {
         Ok(config) => App::with_config(config),
         Err(error) => {
-            let mut app = App::new();
-            app.report_config_warning(error);
-            app
+            App::report_config_warning(error);
+            App::new()
         }
     }
 }
