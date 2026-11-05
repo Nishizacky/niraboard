@@ -11,7 +11,8 @@
 layout = "vertical"
 
 # Cards in display order. Available names:
-# "battery", "cpu", "memory", "disk", "network", "power", "brightness", "audio".
+# "battery", "cpu", "memory", "disk", "network", "bluetooth", "power",
+# "brightness", "audio".
 # Remove a name to hide that card. Cards are drawn in this order; any card
 # that does not fit on the current screen is not shown.
 cards = [
@@ -20,6 +21,7 @@ cards = [
     "memory",
     "disk",
     "network",
+    "bluetooth",
     "power",
     "brightness",
     "audio",

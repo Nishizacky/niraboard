@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod backlight;
 pub mod battery;
+pub mod bluetooth;
 pub mod command;
 pub mod cpu;
 pub mod disk;
@@ -12,6 +13,7 @@ mod sysfs;
 pub use audio::Audio;
 pub use backlight::Brightness;
 pub use battery::{Battery, ChargeState};
+pub use bluetooth::Bluetooth;
 pub use cpu::Cpu;
 pub use disk::Disk;
 pub use memory::Memory;
@@ -22,6 +24,7 @@ use std::time::{Duration, Instant};
 
 const AUDIO_INTERVAL: Duration = Duration::from_secs(4);
 const WIFI_INTERVAL: Duration = Duration::from_secs(15);
+const BLUETOOTH_INTERVAL: Duration = Duration::from_secs(30);
 const PROFILE_INTERVAL: Duration = Duration::from_secs(30);
 const UPOWER_INTERVAL: Duration = Duration::from_secs(30);
 const PUBLIC_IP_INTERVAL: Duration = Duration::from_secs(300);
@@ -37,6 +40,7 @@ pub struct Metrics {
     pub memory: Option<Memory>,
     pub disk: Option<Disk>,
     pub wifi: Option<Wifi>,
+    pub bluetooth: Option<Bluetooth>,
     pub local_ip: Option<String>,
     pub public_ip: Option<String>,
     pub power_profile: Option<PowerProfile>,
@@ -53,9 +57,11 @@ pub struct Monitor {
     cpu: cpu::Sampler,
     last_audio: Option<Instant>,
     last_wifi: Option<Instant>,
+    last_bluetooth: Option<Instant>,
     last_profile: Option<Instant>,
     last_upower: Option<Instant>,
     last_public_ip: Option<Instant>,
+    last_refresh: Option<Instant>,
 }
 
 impl Default for Monitor {
@@ -71,9 +77,11 @@ impl Monitor {
             cpu: cpu::Sampler::default(),
             last_audio: None,
             last_wifi: None,
+            last_bluetooth: None,
             last_profile: None,
             last_upower: None,
             last_public_ip: None,
+            last_refresh: None,
         }
     }
 
@@ -84,14 +92,17 @@ impl Monitor {
         self.read_fast();
         self.read_audio();
         self.read_wifi();
+        self.read_bluetooth();
         self.read_profile();
         self.read_public_ip();
 
         let now = Instant::now();
         self.last_audio = Some(now);
         self.last_wifi = Some(now);
+        self.last_bluetooth = Some(now);
         self.last_profile = Some(now);
         self.last_public_ip = Some(now);
+        self.last_refresh = Some(now);
 
         self.metrics != before
     }
@@ -110,6 +121,10 @@ impl Monitor {
             self.read_wifi();
             self.last_wifi = Some(Instant::now());
         }
+        if due(self.last_bluetooth, BLUETOOTH_INTERVAL) {
+            self.read_bluetooth();
+            self.last_bluetooth = Some(Instant::now());
+        }
         if due(self.last_profile, PROFILE_INTERVAL) {
             self.read_profile();
             self.last_profile = Some(Instant::now());
@@ -119,7 +134,30 @@ impl Monitor {
             self.last_public_ip = Some(Instant::now());
         }
 
+        self.last_refresh = Some(Instant::now());
         self.metrics != before
+    }
+
+    /// A short description of the expensive source that [`Monitor::tick`] is
+    /// about to refresh. The caller can draw this on screen before the
+    /// blocking command starts, so a stalled UI still explains itself.
+    pub fn due_activity_label(&self) -> Option<&'static str> {
+        if due(self.last_bluetooth, BLUETOOTH_INTERVAL) {
+            Some("Refreshing Bluetooth state...")
+        } else if due(self.last_wifi, WIFI_INTERVAL) {
+            Some("Refreshing network state...")
+        } else if due(self.last_profile, PROFILE_INTERVAL) {
+            Some("Refreshing power profile...")
+        } else if due(self.last_public_ip, PUBLIC_IP_INTERVAL) {
+            Some("Refreshing public IP address...")
+        } else {
+            None
+        }
+    }
+
+    /// How long ago the last complete metric refresh finished.
+    pub fn last_refresh_age(&self) -> Option<Duration> {
+        self.last_refresh.map(|refreshed| refreshed.elapsed())
     }
 
     fn read_fast(&mut self) {
@@ -150,6 +188,10 @@ impl Monitor {
     fn read_wifi(&mut self) {
         self.metrics.wifi = network::read();
         self.metrics.local_ip = network::local_ip();
+    }
+
+    fn read_bluetooth(&mut self) {
+        self.metrics.bluetooth = bluetooth::read().ok();
     }
 
     fn read_public_ip(&mut self) {

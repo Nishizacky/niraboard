@@ -4,14 +4,16 @@ A compact, keyboard-first control panel for the terminal — built for **niri**
 as an on-demand replacement for an always-visible bar like Waybar.
 
 `niraboard` is a small Ratatui/Crossterm TUI for Linux laptops, developed on
-CachyOS/Arch. It shows battery, CPU, memory, root filesystem, Wi-Fi, local and
-public IP addresses, power profile, brightness, and PipeWire volume on one
-screen, and lets you change the power profile, brightness, volume, and mute
-state without leaving the terminal. Pressing `n` opens a mako notification
-browser with `Active` and `History` tabs, where you can invoke, dismiss, and
-restore mako's notifications. Clicking the network card (or pressing `w`)
-opens NetworkManager's `nmtui` for connection changes; the network data is
-refreshed when it exits.
+CachyOS/Arch. It shows battery, CPU, memory, root filesystem, Wi-Fi, Bluetooth,
+local and public IP addresses, power profile, brightness, and PipeWire volume
+on one screen, and lets you change the power profile, brightness, volume, and
+mute state without leaving the terminal. Pressing `b` opens a Bluetooth control
+panel where you can power the adapter on or off, scan for devices, and
+connect or disconnect them. Pressing `n` opens a mako notification browser with
+`Active` and `History` tabs, where you can invoke, dismiss, and restore mako's
+notifications. Clicking the network card (or pressing `w`) opens
+NetworkManager's `nmtui` for connection changes; the network data is refreshed
+when it exits.
 
 It is an on-demand utility: there is no daemon, no background service, and no
 polling when it is not running. The header clock and date, colours, the startup
@@ -26,9 +28,9 @@ not need a strip of pixels that is always there; it needs a control panel that
 appears the moment you ask for it and disappears when you are done.
 
 Bind niraboard to a key. One keystroke gives you a single screen with the whole
-machine on it — battery, CPU, memory, disk, network, IP addresses, power
-profile, brightness, and audio. Change what you need in place, press `q`, and
-the workspace is yours again. Between those two moments niraboard uses no
+machine on it — battery, CPU, memory, disk, network, Bluetooth, IP addresses,
+power profile, brightness, and audio. Change what you need in place, press `q`,
+and the workspace is yours again. Between those two moments niraboard uses no
 memory, no CPU, and no battery.
 
 That trade-off is the point:
@@ -37,7 +39,7 @@ That trade-off is the point:
   polling, no process to babysit. Start it, use it, quit it.
 - **A control panel, not a readout.** A bar tells you the volume; niraboard
   lets you change it, mute it, switch the power profile, adjust the backlight,
-  and open `nmtui` from the same screen.
+  control Bluetooth devices, and open `nmtui` from the same screen.
 - **One screen, whole machine.** Everything relevant is visible at once, so you
   look, act, and leave instead of hovering over individual modules.
 - **A normal window.** It is a plain terminal application, so niri decides
@@ -48,7 +50,7 @@ In niri, a single bind is enough:
 
 ```kdl
 binds {
-    Mod+Shift+N { spawn "niraboard"; }
+    Mod+S { spawn "niraboard"; }
 }
 ```
 
@@ -89,6 +91,11 @@ session without one, so the bind above works as-is. Pass
 │Global 203.0.113.7                                                            │
 │click / w: nmtui                                                              │
 ╰──────────────────────────────────────────────────────────────────────────────╯
+╭ Bluetooth ───────────────────────────────────────────────────────────────────╮
+│● On · 1 connected                                                            │
+│MX Keys                                                                       │
+│click / b: control                                                            │
+╰──────────────────────────────────────────────────────────────────────────────╯
 ╭ Power profile ───────────────────────────────────────────────────────────────╮
 │● power-saver                                                                 │
 │  balanced                                                                    │
@@ -104,7 +111,7 @@ session without one, so the bind above works as-is. Pass
 │[-]         40%        [+]                                                    │
 │          [MUTE]                                                              │
 ╰──────────────────────────────────────────────────────────────────────────────╯
- tab focus  ←/→ adjust  m mute  v layout  w nmtui  1-3 profile  r refresh  q quit  [n] notifications
+ tab focus  ←/→ adjust  m mute  v layout  w nmtui  b bluetooth  1-3 profile  r refresh  q quit  [n] notifications
  ready · click cards or buttons
 ```
 
@@ -134,11 +141,11 @@ never crash the application:
 | `brightnessctl` | Changing brightness |
 | `wpctl` (PipeWire/WirePlumber) | Default output volume and mute |
 | `nmcli` (NetworkManager) | Wi-Fi SSID, signal, link rate |
+| `busctl` (systemd, BlueZ D-Bus) | Bluetooth adapter/devices, power, scan, connect; active power-profile read |
 | `ip` (iproute2) | Local IPv4 address used for the default route |
 | `curl` | Public IPv4 lookup over HTTPS |
 | `nmtui` (NetworkManager) | Interactive Wi-Fi and connection editor |
 | `powerprofilesctl` (power-profiles-daemon) | Changing power profile |
-| `busctl` (systemd) | Cheap read of the active profile property |
 | `upower` | Battery fallback when no sysfs battery exists |
 | `makoctl` (mako) | Reading and acting on mako's notification stack |
 
@@ -146,10 +153,14 @@ On Arch/CachyOS, the usual package set is:
 
 ```sh
 sudo pacman -S --needed rust cargo mold brightnessctl networkmanager \
-  power-profiles-daemon pipewire wireplumber upower iproute2 curl mako
+  bluez bluez-utils power-profiles-daemon pipewire wireplumber upower \
+  iproute2 curl mako
 ```
 
-`powerprofilesctl` and `networkmanager` may already be installed and running.
+`powerprofilesctl`, `networkmanager`, and `bluetooth` may already be installed
+and running. Bluetooth controls need the `bluetooth` service and `busctl` from
+systemd. `bluez-utils` is still useful for pairing a new device with
+`bluetoothctl`.
 
 ## Build and install
 
@@ -256,18 +267,28 @@ niraboard --print-default-config > ~/.config/niraboard/config.toml
 | `n` | Open or close the mako notification browser |
 | `v` | Cycle the card layout (see [Layouts](#layouts)) |
 | `w` | Open `nmtui` to manage Wi-Fi connections |
+| `b` | Open or close the Bluetooth control panel |
 | `1` / `2` / `3` | Set `power-saver`, `balanced`, or `performance` directly |
 | `r` | Refresh all data immediately |
 | `q`, `Esc`, `Ctrl-C` | Ask to quit; press `y` to confirm |
-| Mouse | Click a profile row, `[-]`, `[+]`, `[MUTE]`, a card to focus it, the network card, the layout name in the header, or the notifications button |
+| Mouse | Click a profile row, `[-]`, `[+]`, `[MUTE]`, a card to focus it, the network or Bluetooth card, the layout name in the header, or the notifications button |
 
 Clicking `[-]` or `[+]` changes brightness or volume by the configured step
 (5% by default). Clicking a profile row selects it directly. Clicking anywhere
 else in an interactive card gives that card keyboard focus. Clicking the
 network card (or pressing `w`) temporarily leaves niraboard and opens `nmtui`;
-the network data is refreshed when it exits. Clicking the layout name in the
-top-right corner (or pressing `v`) changes the arrangement. Keyboard operation
-never depends on the mouse.
+the network data is refreshed when it exits. Clicking the Bluetooth card (or
+pressing `b`) opens the Bluetooth panel, where `Enter` connects or disconnects
+the selected device, `p` toggles adapter power, and `s` starts a scan. Clicking
+the layout name in the top-right corner (or pressing `v`) changes the
+arrangement. Keyboard operation never depends on the mouse.
+
+The bottom row is an info bar. It shows the current blocking operation
+(`WORK`), an active Bluetooth scan with its remaining time (`SCAN`), the last
+action result (`INFO` or `ERROR`), and how long ago system data was refreshed.
+Actions that call a system utility are drawn once before the command starts,
+so a slow D-Bus call or metric refresh explains the pause instead of looking
+like a frozen dashboard.
 
 While the mako window is open, `tab` / `shift+tab` or `h` / `l` switch between
 `Active` and `History`, `j` / `k` move the selection, `PageUp` / `PageDown`
@@ -308,6 +329,33 @@ so a notification cannot disturb the layout. If mako is not running or
 dashboard. Install and run mako separately; niraboard never starts a
 notification daemon.
 
+### Bluetooth
+
+`b` or the Bluetooth card opens a control panel for the default BlueZ adapter.
+niraboard is only a client for BlueZ: it talks to the system bus through
+`busctl`. One `GetManagedObjects` call reads the adapter and every known device,
+so opening the panel is a single D-Bus round-trip rather than several
+`bluetoothctl` processes. The panel is refreshed again every 10 seconds while
+open.
+
+| Input | Action |
+| --- | --- |
+| `j` / `k`, `↑` / `↓`, `PageUp` / `PageDown`, `Home` / `End` | Move the device selection |
+| `Enter` | Connect or disconnect the selected device |
+| `p` | Power the adapter on or off |
+| `s` | Scan for nearby devices for about 8 seconds |
+| `r` | Refresh the panel immediately |
+| `b`, `Esc` | Close the panel |
+
+The power and scan buttons in the panel's status row are clickable, and
+clicking a device row toggles its connection. Scanning calls BlueZ's
+`StartDiscovery` and stops it after about 8 seconds, when the panel closes, or
+when niraboard exits. Connecting and disconnecting are D-Bus methods that can
+pause the UI until BlueZ completes or the 15-second D-Bus timeout expires. If
+`busctl` is missing or `bluetoothd` is not running, the panel shows the error
+instead of failing the dashboard. Pairing a new device for the first time still
+requires `bluetoothctl` outside niraboard.
+
 ### Layouts
 
 `v` cycles through four arrangements. The startup layout comes from the
@@ -324,13 +372,13 @@ the top-right corner of the header.
 Cards always appear in the order of the `cards` array in the configuration
 file. The grid layouts wrap that order row by row.
 
-Each layout has its own minimum terminal size. With the eight default cards:
+Each layout has its own minimum terminal size. With the nine default cards:
 
 | Layout | Minimum | Bottleneck |
 | --- | --- | --- |
-| `Vertical` | 72×43 | Height for eight card rows |
-| `Horizontal` | 191×8 | Width for eight card columns |
-| `2 columns` | 72×23 | Height for four card rows |
+| `Vertical` | 72×48 | Height for nine card rows |
+| `Horizontal` | 215×8 | Width for nine card columns |
+| `2 columns` | 72×28 | Height for five card rows |
 | `3 columns` | 72×18 | Height for three card rows |
 
 Each extra card row adds five terminal rows. Beyond the 72-column base, every
@@ -377,6 +425,7 @@ cards = [
     "memory",
     "disk",
     "network",
+    "bluetooth",
     "power",
     "brightness",
     "audio",
@@ -453,20 +502,25 @@ sysfs directly.
   pressing `w`) runs `nmtui` for connection changes; NetworkManager and polkit
   apply the usual authorization. A user in the `network` group or with the
   usual desktop policy can query and change connections.
+- **Bluetooth**: `busctl` talks to the system `bluetoothd` service over D-Bus.
+  Power, scanning, and connecting normally work from an active desktop session
+  under the usual BlueZ/polkit policy. Make sure the `bluetooth` service is
+  running and the adapter is not blocked by rfkill.
 - **IP addresses**: the local address is read from `ip -4 route get`. The
   global address is fetched over HTTPS from `https://api.ipify.org` with
   `curl`. Nothing else is sent to that service. If `curl` is missing or the
   lookup fails, the global line shows `—`.
 - **Battery fallback**: `upower` reads the system UPower daemon.
 - **Commands**: every process is started with `Command::new(program).args(...)`.
-  The code never builds a shell command string, and the only variable arguments
-  are profile names and numeric brightness/volume steps from the configuration
-  file (validated to 1-100). `nmtui` runs with the terminal's own stdio after
-  niraboard temporarily restores the terminal.
+  The code never builds a shell command string. Variable arguments are profile
+  names and numeric brightness/volume steps from the configuration file
+  (validated to 1-100), plus BlueZ object paths read from the system bus.
+  `nmtui` runs with the terminal's own stdio after niraboard temporarily
+  restores the terminal.
 
-If a command is missing or fails, the failure appears in the footer instead of
-terminating the UI. For example, with no `brightnessctl` in `PATH`, the
-brightness card remains readable and the footer reports the failed action.
+If a command is missing or fails, the failure appears in the info bar instead
+of terminating the UI. For example, with no `brightnessctl` in `PATH`, the
+brightness card remains readable and the info bar reports the failed action.
 
 ## Data sources and refresh policy
 
@@ -477,6 +531,8 @@ The event loop wakes every 2 seconds. Data collection is deliberately split:
 | CPU, memory, disk, battery, brightness | every tick (2 s) | sysfs/procfs, `statvfs` via rustix |
 | Audio | 4 s | `wpctl get-volume` |
 | Wi-Fi and local IP | 15 s | `nmcli ... --rescan no`, `ip -4 route get` |
+| Bluetooth card | 30 s | `busctl` `GetManagedObjects` on `org.bluez` |
+| Bluetooth panel | on open, then every 10 s while open | `busctl` `GetManagedObjects` |
 | Global IP | 300 s | `curl https://api.ipify.org` |
 | Power profile | 30 s | `busctl` property read |
 | UPower fallback | 30 s, only when no sysfs battery | `upower -e` / `upower -i` |
@@ -488,11 +544,15 @@ percentage.
 
 The Wi-Fi refresh uses NetworkManager's cached list (`--rescan no`), so it does
 not force a radio scan every 15 seconds. The local IP lookup is cheap and rides
-along with that refresh. The global IP lookup is deliberately much slower (5
-minutes) because it is an external HTTPS request. The profile is normally read
-through `busctl` because `powerprofilesctl` is a Python program that takes about
-half a second to start. `powerprofilesctl` remains the tool used for profile
-changes, as recommended by power-profiles-daemon.
+along with that refresh. Bluetooth reads use one BlueZ D-Bus round-trip, so the
+card is still sampled conservatively every 30 seconds; the open panel refreshes
+more often. Discovery is started with `StartDiscovery` and stopped explicitly,
+so a scan never blocks the event loop and does not leave the adapter
+discovering. The global IP lookup is deliberately much slower (5 minutes)
+because it is an external HTTPS request. The profile is normally read through
+`busctl` because `powerprofilesctl` is a Python program that takes about half a
+second to start. `powerprofilesctl` remains the tool used for profile changes,
+as recommended by power-profiles-daemon.
 
 Rendering is immediate-mode, but it is not unconditional: each refresh produces
 a typed `Metrics` snapshot, and the loop only redraws when that snapshot, the
@@ -505,10 +565,11 @@ focus, the status message, the clock text, or the terminal size changes. A
 src/
 ├── main.rs          terminal setup/restore, event/tick loop, CLI options
 ├── app.rs           application state, focus, key/mouse handling, actions
+├── bluetooth.rs     Bluetooth panel state, selection, scan/power/connect actions
 ├── clock.rs         strftime-style header clock formatting
 ├── config.rs        TOML loading, colours, clock, layout, card order, steps
 ├── event.rs         crossterm event polling
-├── actions.rs       profile/brightness/audio/nmtui command wrappers
+├── actions.rs       profile/brightness/audio/nmtui/Bluetooth command wrappers
 ├── notifications.rs mako stack client, tabs, selection, invoke/dismiss actions
 ├── spawn.rs         relaunches the dashboard in a terminal when needed
 ├── ui.rs            Ratatui layout, widgets, hit areas, colours
@@ -521,6 +582,7 @@ src/
     ├── memory.rs    /proc/meminfo
     ├── disk.rs      filesystem usage via rustix and mount table filesystem type
     ├── network.rs   nmcli parsing, local/global IP lookup
+    ├── bluetooth.rs BlueZ D-Bus parsing, adapter and device snapshots
     ├── audio.rs     wpctl parsing
     ├── power_profile.rs
     └── backlight.rs
@@ -543,10 +605,16 @@ src/
   `App` state. Widgets are cheap values constructed per frame; there is no
   retained widget tree to synchronise.
 - **Rects and hit areas**: `ui::draw` returns `HitAreas` (card rects, profile
-  rows, button rects, the network card, and notification targets). `main` stores
-  them in `App`; mouse events call `HitAreas::action_at`, which maps coordinates
-  to a small `ClickAction` enum. Rendering and input therefore share one layout
-  definition.
+  rows, button rects, the network and Bluetooth cards, Bluetooth panel targets,
+  and notification targets). `main` stores them in `App`; mouse events call
+  `HitAreas::action_at`, which maps coordinates to a small `ClickAction` enum.
+  Rendering and input therefore share one layout definition.
+- **Bluetooth panel**: `bluetooth::Panel` keeps its open state, selection,
+  latest BlueZ D-Bus snapshot, and a short action notice. Every change uses the
+  BlueZ D-Bus API and re-reads the adapter; discovery is started with
+  `StartDiscovery` and explicitly stopped on completion, close, or drop. The
+  dashboard card is fed from the normal `Metrics` snapshot, and `App` copies the
+  panel snapshot into it after an action so both views stay in step.
 - **Notifications**: `notifications::Center` is a client for mako, not a
   notification daemon or history store. It owns the open state, selected tab,
   selection, cached `makoctl` output, last refresh time, and any error. `App`
@@ -557,6 +625,11 @@ src/
   visible changed. `main` draws only when that flag is set. `Metrics` holds
   `Option`s for unavailable sources and derives `PartialEq`, so the same typed
   snapshot is both the UI model and the change detector.
+- **Progress before blocking work**: slow key and mouse actions are queued as a
+  `PendingAction` with an activity label. `main` draws the info bar once, then
+  calls `App::run_pending`; scheduled `Monitor` refreshes use the same two-step
+  draw for expensive sources such as Bluetooth. This keeps the UI explanatory
+  even though the actual system commands are still synchronous.
 
 ### Why no async runtime?
 
@@ -572,8 +645,8 @@ profiles. Making that action non-blocking is listed as a future improvement.
 
 - Linux-only; the sysfs/procfs paths are intentionally not portable.
 - The minimum terminal size depends on the layout and the number of configured
-  cards. With all eight default cards it is 72×43 for `Vertical`, 191×8 for
-  `Horizontal`, 72×23 for two columns, and 72×18 for three columns. Below that,
+  cards. With all nine default cards it is 72×48 for `Vertical`, 215×8 for
+  `Horizontal`, 72×28 for two columns, and 72×18 for three columns. Below that,
   the screen shows a centered hint with the required dimensions. `Vertical`
   needs the most height, while `Horizontal` trades height for width; the grid
   layouts fit shorter terminals.
@@ -589,6 +662,11 @@ profiles. Making that action non-blocking is listed as a future improvement.
 - Wi-Fi signal is NetworkManager's percentage and the link rate is the cached
   NM value; raw dBm and channel information are not shown. Connection changes
   are delegated to `nmtui`, which temporarily leaves the niraboard screen.
+- The Bluetooth panel manages the default adapter only. It lists devices known
+  to BlueZ, marks connected ones, and can power, scan, connect, and disconnect.
+  Pairing, trusting, and forgetting devices are not exposed; use
+  `bluetoothctl` for those operations. Connect/disconnect calls can block the
+  UI for up to 15 seconds while BlueZ completes or the D-Bus timeout fires.
 - Local IP is the source address for the default route. Secondary addresses,
   IPv6 local addresses, and per-interface lists are not shown.
 - Global IP comes from `api.ipify.org` over IPv4, so an offline machine or an
@@ -609,8 +687,8 @@ profiles. Making that action non-blocking is listed as a future improvement.
 
 ## Possible future improvements
 
-- Move slow actions to a small worker thread or use the D-Bus API directly, so
-  profile changes never pause input.
+- Move the remaining slow actions, such as Bluetooth connect and profile
+  changes, to a worker thread so they never pause input.
 - Extend the configuration file with refresh intervals and key bindings.
 - Cache the last global IP across runs so a temporarily offline machine still
   shows the previous value.
@@ -619,7 +697,8 @@ profiles. Making that action non-blocking is listed as a future improvement.
 - Battery time-to-empty and charge-threshold controls (with explicit policy
   checks).
 - Per-core CPU view and a compact process list.
-- Native UPower/NetworkManager D-Bus integrations to avoid process spawning.
+- Native UPower/NetworkManager D-Bus integrations to avoid process spawning,
+  and pairing/trust controls in the Bluetooth panel.
 - Accessibility/theme options and remembering the selected layout between runs.
 - Package into a proper Arch release with a PKGBUILD that points at a tagged
   tarball.

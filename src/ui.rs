@@ -34,10 +34,15 @@ pub struct HitAreas {
     mute: Option<Rect>,
     layout: Option<Rect>,
     wifi: Option<Rect>,
+    bluetooth: Option<Rect>,
     notification_button: Option<Rect>,
     notification_tabs: Vec<(Rect, Tab)>,
     notification_rows: Vec<(Rect, usize)>,
     notification_window: Option<Rect>,
+    bluetooth_power: Option<Rect>,
+    bluetooth_scan: Option<Rect>,
+    bluetooth_rows: Vec<(Rect, usize)>,
+    bluetooth_window: Option<Rect>,
     steps: Steps,
 }
 
@@ -50,6 +55,10 @@ pub enum ClickAction {
     ToggleMute,
     CycleLayout,
     OpenNetwork,
+    OpenBluetooth,
+    ToggleBluetoothPower,
+    ScanBluetooth,
+    ToggleBluetoothDevice(usize),
     ToggleNotifications,
     SelectNotificationTab(Tab),
     SelectNotification(usize),
@@ -58,6 +67,22 @@ pub enum ClickAction {
 impl HitAreas {
     pub fn action_at(&self, x: u16, y: u16) -> Option<ClickAction> {
         let position = Position::new(x, y);
+
+        // The Bluetooth panel is drawn over the dashboard and its footer, so
+        // its targets must win over everything underneath.
+        if contains(self.bluetooth_power, position) {
+            return Some(ClickAction::ToggleBluetoothPower);
+        }
+        if contains(self.bluetooth_scan, position) {
+            return Some(ClickAction::ScanBluetooth);
+        }
+        if let Some((_, index)) = self
+            .bluetooth_rows
+            .iter()
+            .find(|(rect, _)| rect.contains(position))
+        {
+            return Some(ClickAction::ToggleBluetoothDevice(*index));
+        }
 
         if contains(self.notification_button, position) {
             return Some(ClickAction::ToggleNotifications);
@@ -97,6 +122,9 @@ impl HitAreas {
         if contains(self.wifi, position) {
             return Some(ClickAction::OpenNetwork);
         }
+        if contains(self.bluetooth, position) {
+            return Some(ClickAction::OpenBluetooth);
+        }
 
         self.profile_rows
             .iter()
@@ -114,6 +142,11 @@ impl HitAreas {
     pub fn notification_window(&self) -> Option<Rect> {
         self.notification_window
     }
+
+    /// Rectangle occupied by the Bluetooth panel, when it is open.
+    pub fn bluetooth_window(&self) -> Option<Rect> {
+        self.bluetooth_window
+    }
 }
 
 fn contains(rect: Option<Rect>, position: Position) -> bool {
@@ -126,9 +159,16 @@ pub fn draw(frame: &mut Frame, app: &App) -> HitAreas {
     let colors = app.config.colors;
     let (min_width, min_height) = minimum_size(app.layout, app.config.cards.len());
 
+    let mut hits = HitAreas {
+        steps: app.config.steps,
+        ..HitAreas::default()
+    };
+
     if area.width < min_width || area.height < min_height {
-        draw_too_small(frame, area, min_width, min_height, colors);
-        return HitAreas::default();
+        draw_too_small(
+            frame, area, app.layout, min_width, min_height, &mut hits, colors,
+        );
+        return hits;
     }
 
     let [header, body, footer] = Layout::vertical([
@@ -138,14 +178,14 @@ pub fn draw(frame: &mut Frame, app: &App) -> HitAreas {
     ])
     .areas(area);
 
-    let mut hits = HitAreas {
-        steps: app.config.steps,
-        ..HitAreas::default()
-    };
     draw_header(frame, header, app, &mut hits, colors);
 
     draw_body(frame, body, app, &mut hits, colors);
     draw_footer(frame, footer, app, &mut hits, colors);
+
+    if app.bluetooth.is_open() {
+        draw_bluetooth_panel(frame, area, app, &mut hits, colors);
+    }
 
     if app.notifications.is_open() {
         draw_notifications(frame, area, app, &mut hits, colors);
@@ -277,6 +317,7 @@ fn draw_card(
         Card::Memory => draw_memory(frame, area, app, colors),
         Card::Disk => draw_disk(frame, area, app, colors),
         Card::Network => draw_wifi(frame, area, app, hits, colors),
+        Card::Bluetooth => draw_bluetooth_card(frame, area, app, hits, colors),
         Card::Power => draw_power(frame, area, app, hits, colors),
         Card::Brightness => draw_brightness(frame, area, app, hits, colors),
         Card::Audio => draw_audio(frame, area, app, hits, colors),
@@ -382,6 +423,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitAreas, co
         Span::raw(" layout  "),
         key("w", colors),
         Span::raw(" nmtui  "),
+        key("b", colors),
+        Span::raw(" bluetooth  "),
         key("1-3", colors),
         Span::raw(" profile  "),
         key("r", colors),
@@ -413,15 +456,74 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitAreas, co
     );
     hits.notification_button = Some(columns[1]);
 
-    let (text, color) = match app.status_text() {
-        Some((text, StatusLevel::Info)) => (text, colors.ok),
-        Some((text, StatusLevel::Error)) => (text, colors.bad),
-        None => ("ready · click cards or buttons", colors.muted),
+    draw_info_bar(frame, rows[1], app, colors);
+}
+
+fn draw_info_bar(frame: &mut Frame, area: Rect, app: &App, colors: Colors) {
+    if area.is_empty() {
+        return;
+    }
+
+    let (badge, text, color) = if let Some(activity) = app.activity_text() {
+        ("WORK", activity.to_owned(), colors.main)
+    } else if let Some(remaining) = app.bluetooth.scan_remaining() {
+        (
+            "SCAN",
+            format!(
+                "Scanning for Bluetooth devices... {}s left",
+                remaining.as_secs()
+            ),
+            colors.main,
+        )
+    } else {
+        match app.status_text() {
+            Some((text, StatusLevel::Info)) => ("INFO", text.to_owned(), colors.ok),
+            Some((text, StatusLevel::Error)) => ("ERROR", text.to_owned(), colors.bad),
+            None => ("INFO", "ready".to_owned(), colors.muted),
+        }
     };
+
+    let detail = if app.activity_text().is_some() {
+        "working...".to_owned()
+    } else {
+        app.monitor
+            .last_refresh_age()
+            .map(|age| format!("updated {} ago", format_age(age)))
+            .unwrap_or_else(|| "not refreshed yet".to_owned())
+    };
+
+    let widths = Layout::horizontal([Constraint::Fill(1), Constraint::Length(34)]).split(area);
+    let line = vec![
+        Span::styled(
+            format!(" {badge} "),
+            Style::default()
+                .fg(Color::Black)
+                .bg(color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(text, Style::default().fg(color)),
+    ];
+    frame.render_widget(Paragraph::new(Line::from(line)), widths[0]);
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(text, Style::default().fg(color)))),
-        rows[1],
+        Paragraph::new(Line::from(Span::styled(
+            detail,
+            Style::default().fg(colors.muted),
+        )))
+        .alignment(Alignment::Right),
+        widths[1],
     );
+}
+
+fn format_age(age: std::time::Duration) -> String {
+    let seconds = age.as_secs();
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h {:02}m", seconds / 3600, (seconds % 3600) / 60)
+    }
 }
 
 fn draw_battery(frame: &mut Frame, area: Rect, app: &App, colors: Colors) {
@@ -752,6 +854,115 @@ fn draw_wifi(frame: &mut Frame, area: Rect, app: &App, hits: &mut HitAreas, colo
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+fn draw_bluetooth_card(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    hits: &mut HitAreas,
+    colors: Colors,
+) {
+    let block = card("Bluetooth", false, colors);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    hits.bluetooth = Some(area);
+
+    if inner.is_empty() {
+        return;
+    }
+
+    let click_hint = Line::from(Span::styled(
+        "click / b: control",
+        Style::default().fg(colors.main),
+    ));
+    let Some(bluetooth) = app.monitor.metrics.bluetooth.as_ref() else {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "Bluetooth unavailable",
+                    Style::default().fg(colors.muted),
+                )),
+                Line::from(Span::styled(
+                    "busctl · BlueZ D-Bus",
+                    Style::default().fg(colors.muted),
+                )),
+                click_hint,
+            ]),
+            inner,
+        );
+        return;
+    };
+
+    let Some(adapter) = bluetooth.adapter.as_ref() else {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "No Bluetooth adapter",
+                    Style::default().fg(colors.muted),
+                )),
+                Line::from(Span::styled(
+                    "nothing to control",
+                    Style::default().fg(colors.muted),
+                )),
+                click_hint,
+            ]),
+            inner,
+        );
+        return;
+    };
+
+    if !adapter.powered {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "○ Bluetooth off",
+                    Style::default()
+                        .fg(colors.muted)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    "click / b to power on",
+                    Style::default().fg(colors.muted),
+                )),
+                click_hint,
+            ]),
+            inner,
+        );
+        return;
+    }
+
+    let connected = bluetooth.connected_count();
+    let mut names: Vec<&str> = bluetooth
+        .devices
+        .iter()
+        .filter(|device| device.connected)
+        .map(|device| device.label())
+        .collect();
+    let detail = if names.is_empty() {
+        "No connected devices".to_owned()
+    } else if names.len() > 2 {
+        let extra = names.len() - 2;
+        names.truncate(2);
+        format!("{} +{extra}", names.join(" · "))
+    } else {
+        names.join(" · ")
+    };
+
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                format!("● On · {connected} connected"),
+                Style::default().fg(colors.ok).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                fit(&detail, inner.width),
+                Style::default().fg(colors.text),
+            )),
+            click_hint,
+        ]),
+        inner,
+    );
+}
+
 /// Local and global IP addresses, shown even when Wi-Fi itself is unavailable.
 fn ip_lines(app: &App, colors: Colors) -> Vec<Line<'static>> {
     let local = app
@@ -1074,14 +1285,350 @@ fn centered_message(frame: &mut Frame, area: Rect, lines: &[&str], color: Color)
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), middle);
 }
 
-fn draw_too_small(frame: &mut Frame, area: Rect, width: u16, height: u16, colors: Colors) {
+fn draw_too_small(
+    frame: &mut Frame,
+    area: Rect,
+    layout: LayoutMode,
+    width: u16,
+    height: u16,
+    hits: &mut HitAreas,
+    colors: Colors,
+) {
+    if area.is_empty() {
+        return;
+    }
+
     let required = format!("need at least {width} x {height}");
-    centered_message(
-        frame,
-        area,
-        &["Terminal too small", required.as_str(), "press q to quit"],
-        colors.warn,
+    let layout_button = format!("[ v ] change layout: {}", layout.label());
+    let text_rows = [
+        "Terminal too small",
+        required.as_str(),
+        layout_button.as_str(),
+        "press q to quit",
+    ];
+
+    let height = (text_rows.len() as u16).min(area.height);
+    let [_, middle, _] = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(height),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+
+    let lines: Vec<Line> = text_rows
+        .iter()
+        .enumerate()
+        .map(|(index, text)| {
+            let style = if index == 2 {
+                Style::default()
+                    .fg(colors.main)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(colors.warn)
+            };
+            Line::from(Span::styled(*text, style))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), middle);
+
+    // Keep the layout switcher clickable even though the dashboard itself
+    // cannot be drawn. Narrow terminals clip the label, so the hit target
+    // follows the visible centred text instead of overflowing the screen.
+    let button_row = middle.y.saturating_add(2);
+    if middle.height > 2 && button_row < middle.bottom() {
+        let button_width = (layout_button.chars().count() as u16).min(area.width);
+        if button_width > 0 {
+            let x = area.x + area.width.saturating_sub(button_width) / 2;
+            hits.layout = Some(Rect::new(x, button_row, button_width, 1));
+        }
+    }
+}
+
+fn draw_bluetooth_panel(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    hits: &mut HitAreas,
+    colors: Colors,
+) {
+    if area.is_empty() {
+        return;
+    }
+
+    let width = area.width.saturating_sub(4).clamp(48, 86).min(area.width);
+    let height = area.height.saturating_sub(4).clamp(10, 24).min(area.height);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
     );
+
+    hits.bluetooth_window = Some(popup);
+    frame.render_widget(Clear, popup);
+
+    let panel = &app.bluetooth;
+    let title = match panel.adapter() {
+        Some(adapter) => format!(" bluetooth · {} ", fit(adapter.label(), 28)),
+        None => " bluetooth ".to_owned(),
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(colors.main))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(colors.main)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    if inner.height < 3 {
+        return;
+    }
+
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Fill(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+
+    draw_bluetooth_status(frame, rows[0], panel, hits, colors);
+    draw_bluetooth_list(frame, rows[1], panel, hits, colors);
+    draw_bluetooth_hint(frame, rows[2], panel, colors);
+}
+
+fn draw_bluetooth_status(
+    frame: &mut Frame,
+    area: Rect,
+    panel: &crate::bluetooth::Panel,
+    hits: &mut HitAreas,
+    colors: Colors,
+) {
+    if area.is_empty() {
+        return;
+    }
+
+    let adapter = panel.adapter();
+    let powered = adapter.is_some_and(|adapter| adapter.powered);
+    let power_label = if powered { "[POWER OFF]" } else { "[POWER ON]" };
+    let scan_label = if panel.is_scanning() {
+        "[SCANNING]"
+    } else {
+        "[SCAN]"
+    };
+    let gap = 1u16;
+    let power_width = power_label.chars().count() as u16;
+    let scan_width = scan_label.chars().count() as u16;
+    let controls_width = power_width + gap + scan_width;
+    let columns =
+        Layout::horizontal([Constraint::Fill(1), Constraint::Length(controls_width)]).split(area);
+
+    let mut status = Vec::new();
+    if panel.error().is_some() {
+        status.push(Span::styled(
+            "! Bluetooth unavailable",
+            Style::default().fg(colors.bad).add_modifier(Modifier::BOLD),
+        ));
+    } else if let Some(adapter) = adapter {
+        status.push(Span::styled(
+            if adapter.powered { "● On" } else { "○ Off" },
+            Style::default()
+                .fg(if adapter.powered {
+                    colors.ok
+                } else {
+                    colors.muted
+                })
+                .add_modifier(Modifier::BOLD),
+        ));
+        status.push(Span::styled(
+            format!(" · {}", adapter.label()),
+            Style::default().fg(colors.text),
+        ));
+        if adapter.powered {
+            status.push(Span::styled(
+                format!(" · {} connected", panel.connected_count()),
+                Style::default().fg(colors.muted),
+            ));
+        }
+    } else {
+        status.push(Span::styled(
+            "No Bluetooth adapter",
+            Style::default().fg(colors.warn),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(status)),
+        Rect::new(columns[0].x, columns[0].y, columns[0].width, 1),
+    );
+
+    if adapter.is_none() {
+        return;
+    }
+
+    let power_area = Rect::new(columns[1].x, columns[1].y, power_width, 1);
+    let scan_area = Rect::new(
+        columns[1].x.saturating_add(power_width + gap),
+        columns[1].y,
+        scan_width,
+        1,
+    );
+    let button_style = Style::default()
+        .fg(colors.main)
+        .add_modifier(Modifier::BOLD);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(power_label, button_style))),
+        power_area,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(scan_label, button_style))),
+        scan_area,
+    );
+    hits.bluetooth_power = Some(power_area);
+    hits.bluetooth_scan = Some(scan_area);
+}
+
+fn draw_bluetooth_list(
+    frame: &mut Frame,
+    area: Rect,
+    panel: &crate::bluetooth::Panel,
+    hits: &mut HitAreas,
+    colors: Colors,
+) {
+    if area.is_empty() {
+        return;
+    }
+
+    if let Some(error) = panel.error() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                error.to_owned(),
+                Style::default().fg(colors.bad),
+            )))
+            .wrap(Wrap { trim: true }),
+            area,
+        );
+        return;
+    }
+
+    if panel.adapter().is_none() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "No Bluetooth adapter found",
+                Style::default().fg(colors.muted),
+            ))),
+            area,
+        );
+        return;
+    }
+
+    let devices = panel.devices();
+    if devices.is_empty() {
+        let message = if panel.is_scanning() {
+            "Scanning for devices..."
+        } else {
+            "No devices known · press s to scan"
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                message,
+                Style::default().fg(colors.muted),
+            ))),
+            area,
+        );
+        return;
+    }
+
+    let visible = area.height as usize;
+    let start = selection_offset(devices.len(), panel.selected(), visible);
+    let text_width = area.width.saturating_sub(2);
+    let lines: Vec<Line> = devices
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+        .map(|(index, device)| {
+            let selected = index == panel.selected();
+            let (marker, marker_color) = if selected {
+                ("▸", colors.main)
+            } else if device.connected {
+                ("●", colors.ok)
+            } else {
+                ("○", colors.muted)
+            };
+            let text_style = if selected {
+                Style::default()
+                    .fg(colors.main)
+                    .add_modifier(Modifier::BOLD)
+            } else if device.connected {
+                Style::default().fg(colors.ok)
+            } else {
+                Style::default().fg(colors.text)
+            };
+
+            let mut text = device.label().to_owned();
+            if text != device.address {
+                text.push_str("  ");
+                text.push_str(&device.address);
+            }
+            Line::from(vec![
+                Span::styled(
+                    format!("{marker} "),
+                    Style::default()
+                        .fg(marker_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(fit(&text, text_width), text_style),
+            ])
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), area);
+
+    for (row, (index, _)) in devices
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+        .enumerate()
+    {
+        let rect = Rect::new(area.x, area.y.saturating_add(row as u16), area.width, 1);
+        hits.bluetooth_rows.push((rect, index));
+    }
+}
+
+fn draw_bluetooth_hint(
+    frame: &mut Frame,
+    area: Rect,
+    panel: &crate::bluetooth::Panel,
+    colors: Colors,
+) {
+    if area.is_empty() {
+        return;
+    }
+
+    let line = if let Some((notice, is_error)) = panel.notice() {
+        Line::from(Span::styled(
+            fit(notice, area.width),
+            Style::default().fg(if is_error { colors.bad } else { colors.ok }),
+        ))
+    } else {
+        Line::from(vec![
+            key("↵", colors),
+            Span::raw(" toggle  "),
+            key("p", colors),
+            Span::raw(" power  "),
+            key("s", colors),
+            Span::raw(" scan  "),
+            key("r", colors),
+            Span::raw(" refresh  "),
+            key("b/Esc", colors),
+            Span::raw(" close"),
+        ])
+    };
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 fn draw_notifications(
@@ -1441,9 +1988,11 @@ mod tests {
     use super::*;
     use crate::app::App;
     use crate::notifications::{DesktopNotification, Urgency};
+    use crate::system::bluetooth::{Adapter, Bluetooth, Device};
     use crate::system::{Audio, Battery, Brightness, ChargeState, Disk};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn sample(id: u32, app_name: &str, summary: &str, body: Option<&str>) -> DesktopNotification {
         DesktopNotification {
@@ -1532,6 +2081,22 @@ mod tests {
             max: 7500,
             device: "intel_backlight".to_owned(),
         });
+        app.monitor.metrics.bluetooth = Some(Bluetooth {
+            adapter: Some(Adapter {
+                path: "/org/bluez/hci0".to_owned(),
+                address: "4C:EB:BD:6A:B7:AA".to_owned(),
+                alias: Some("cachyos".to_owned()),
+                powered: true,
+                discoverable: false,
+                discovering: false,
+            }),
+            devices: vec![Device {
+                path: "/org/bluez/hci0/dev_E8_EE_CC_66_73_58".to_owned(),
+                address: "E8:EE:CC:66:73:58".to_owned(),
+                name: Some("MX Keys".to_owned()),
+                connected: true,
+            }],
+        });
         app.monitor.metrics.local_ip = Some("192.168.1.42".to_owned());
         app.monitor.metrics.public_ip = Some("203.0.113.7".to_owned());
         app
@@ -1539,7 +2104,7 @@ mod tests {
 
     #[test]
     fn renders_all_cards_at_vertical_minimum() {
-        let (screen, hits) = render(72, 43);
+        let (screen, hits) = render(72, 48);
 
         for label in [
             "NIRABOARD",
@@ -1548,6 +2113,7 @@ mod tests {
             "Memory",
             "Disk",
             "Network",
+            "Bluetooth",
             "Power profile",
             "Brightness",
             "Audio",
@@ -1560,6 +2126,7 @@ mod tests {
         assert!(hits.brightness_plus.is_some());
         assert!(hits.volume_plus.is_some());
         assert!(hits.mute.is_some());
+        assert!(hits.bluetooth.is_some());
     }
 
     #[test]
@@ -1616,16 +2183,37 @@ mod tests {
     fn shows_message_when_terminal_is_too_small() {
         let (screen, hits) = render(60, 18);
         assert!(screen.contains("Terminal too small"));
-        assert!(screen.contains("need at least 72 x 43"));
+        assert!(screen.contains("need at least 72 x 48"));
+        assert!(screen.contains("[ v ] change layout: Vertical"));
         assert!(hits.profile_rows.is_empty());
+
+        let rect = hits.layout.expect("layout button");
+        assert_eq!(
+            hits.action_at(rect.x, rect.y),
+            Some(ClickAction::CycleLayout)
+        );
+    }
+
+    #[test]
+    fn too_small_screen_offers_layout_button_for_current_layout() {
+        let (screen, hits) = render_layout(120, 10, LayoutMode::Horizontal);
+
+        assert!(screen.contains("Terminal too small"));
+        assert!(screen.contains("[ v ] change layout: Horizontal"));
+
+        let rect = hits.layout.expect("layout button");
+        assert_eq!(
+            hits.action_at(rect.x, rect.y),
+            Some(ClickAction::CycleLayout)
+        );
     }
 
     #[test]
     fn minimum_size_depends_on_layout() {
-        assert_eq!(minimum_size(LayoutMode::Vertical, 8), (72, 43));
-        assert_eq!(minimum_size(LayoutMode::Horizontal, 8), (191, 8));
-        assert_eq!(minimum_size(LayoutMode::TwoColumns, 8), (72, 23));
-        assert_eq!(minimum_size(LayoutMode::ThreeColumns, 8), (72, 18));
+        assert_eq!(minimum_size(LayoutMode::Vertical, 9), (72, 48));
+        assert_eq!(minimum_size(LayoutMode::Horizontal, 9), (215, 8));
+        assert_eq!(minimum_size(LayoutMode::TwoColumns, 9), (72, 28));
+        assert_eq!(minimum_size(LayoutMode::ThreeColumns, 9), (72, 18));
     }
 
     #[test]
@@ -1638,17 +2226,17 @@ mod tests {
 
     #[test]
     fn horizontal_layout_needs_extra_width() {
-        // Tall enough for every card, but far too narrow for eight columns.
+        // Tall enough for every card, but far too narrow for nine columns.
         let (screen, hits) = render_layout(120, 60, LayoutMode::Horizontal);
 
         assert!(screen.contains("Terminal too small"));
-        assert!(screen.contains("need at least 191 x 8"));
+        assert!(screen.contains("need at least 215 x 8"));
         assert!(hits.profile_rows.is_empty());
     }
 
     #[test]
     fn renders_cpu_model_and_threads() {
-        let (screen, _) = render_layout(120, 60, LayoutMode::Vertical);
+        let (screen, _) = render_layout(120, 66, LayoutMode::Vertical);
 
         assert!(screen.contains("Threads 16"));
         assert!(screen.contains("AMD Ryzen 7 5800X"));
@@ -1721,6 +2309,12 @@ mod tests {
             Some(ClickAction::OpenNetwork)
         );
 
+        let bluetooth = hits.bluetooth.expect("bluetooth card");
+        assert_eq!(
+            hits.action_at(bluetooth.x, bluetooth.y),
+            Some(ClickAction::OpenBluetooth)
+        );
+
         let (rect, profile) = hits.profile_rows[1];
         assert_eq!(
             hits.action_at(rect.x, rect.y),
@@ -1741,6 +2335,43 @@ mod tests {
     }
 
     #[test]
+    fn info_bar_shows_ready_state_and_data_age() {
+        let (screen, _) = render_layout(120, 60, LayoutMode::Vertical);
+
+        assert!(screen.contains(" INFO "));
+        assert!(screen.contains("ready"));
+        assert!(screen.contains("not refreshed yet"));
+    }
+
+    #[test]
+    fn info_bar_shows_queued_work_before_it_blocks() {
+        let mut app = test_app();
+        assert!(app.begin_tick_activity());
+
+        let (screen, _) = render_app(&app, 120, 60);
+
+        assert!(screen.contains(" WORK "));
+        assert!(screen.contains("Refreshing Bluetooth state..."));
+        assert!(screen.contains("working..."));
+    }
+
+    #[test]
+    fn info_bar_shows_the_latest_action_result() {
+        let mut app = test_app();
+        for _ in 0..2 {
+            app.handle_event(crate::event::Event::Key(KeyEvent::new(
+                KeyCode::Char('v'),
+                KeyModifiers::NONE,
+            )));
+        }
+
+        let (screen, _) = render_app(&app, 120, 60);
+
+        assert!(screen.contains(" INFO "));
+        assert!(screen.contains("Layout: 2 columns"));
+    }
+
+    #[test]
     fn footer_notification_button_is_clickable() {
         let (_, hits) = render_layout(120, 60, LayoutMode::Vertical);
         let rect = hits.notification_button.expect("notification button");
@@ -1748,6 +2379,56 @@ mod tests {
         assert_eq!(
             hits.action_at(rect.x, rect.y),
             Some(ClickAction::ToggleNotifications)
+        );
+    }
+
+    #[test]
+    fn renders_bluetooth_card_status_and_connected_device() {
+        let (screen, _) = render_layout(120, 60, LayoutMode::Vertical);
+
+        assert!(screen.contains("● On · 1 connected"));
+        assert!(screen.contains("MX Keys"));
+        assert!(screen.contains("click / b: control"));
+    }
+
+    #[test]
+    fn renders_bluetooth_panel_with_controls_and_devices() {
+        let mut app = test_app();
+        let data = app
+            .monitor
+            .metrics
+            .bluetooth
+            .clone()
+            .expect("bluetooth metrics");
+        app.bluetooth.force_open();
+        app.bluetooth.set_data(data);
+
+        let (screen, hits) = render_app(&app, 120, 60);
+
+        for label in [
+            "bluetooth · cachyos",
+            "● On",
+            "[POWER OFF]",
+            "[SCAN]",
+            "MX Keys",
+            "toggle",
+            "power",
+            "scan",
+            "refresh",
+            "close",
+        ] {
+            assert!(screen.contains(label), "missing {label} in\n{screen}");
+        }
+
+        assert!(hits.bluetooth_window.is_some());
+        assert!(hits.bluetooth_power.is_some());
+        assert!(hits.bluetooth_scan.is_some());
+        assert_eq!(hits.bluetooth_rows.len(), 1);
+
+        let (rect, index) = hits.bluetooth_rows[0];
+        assert_eq!(
+            hits.action_at(rect.x, rect.y),
+            Some(ClickAction::ToggleBluetoothDevice(index))
         );
     }
 
@@ -1881,7 +2562,7 @@ mod tests {
         app.config.clock.format = "CLOCK".repeat(20);
         assert!(app.update_clock());
 
-        let (screen, _) = render_app(&app, 72, 43);
+        let (screen, _) = render_app(&app, 72, 48);
         let header = screen.lines().next().expect("header");
 
         assert!(!header.contains("CLOCK"));
@@ -1900,6 +2581,7 @@ mod tests {
                 "Memory",
                 "Disk",
                 "Network",
+                "Bluetooth",
                 "Power profile",
                 "Brightness",
                 "Audio",

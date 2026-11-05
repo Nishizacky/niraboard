@@ -1,5 +1,6 @@
 mod actions;
 mod app;
+mod bluetooth;
 mod clock;
 mod config;
 mod event;
@@ -181,8 +182,18 @@ fn parse_config_path(path: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(path))
 }
 
+fn draw(session: &mut TerminalSession, app: &App) -> Result<HitAreas> {
+    let mut hits = HitAreas::default();
+    session.terminal.draw(|frame| {
+        hits = ui::draw(frame, app);
+    })?;
+    Ok(hits)
+}
+
 fn run(session: &mut TerminalSession, mut app: App) -> Result<()> {
-    app.refresh_all();
+    app.begin_initial_refresh();
+    app.hits = draw(session, &app)?;
+    app.run_pending();
 
     let mut dirty = true;
     let mut last_tick = Instant::now();
@@ -193,11 +204,7 @@ fn run(session: &mut TerminalSession, mut app: App) -> Result<()> {
         }
 
         if dirty {
-            let mut hits = HitAreas::default();
-            session.terminal.draw(|frame| {
-                hits = ui::draw(frame, &app);
-            })?;
-            app.hits = hits;
+            app.hits = draw(session, &app)?;
             dirty = false;
         }
 
@@ -211,6 +218,14 @@ fn run(session: &mut TerminalSession, mut app: App) -> Result<()> {
             dirty |= app.handle_event(event);
         }
 
+        if app.has_pending() {
+            if dirty {
+                app.hits = draw(session, &app)?;
+                dirty = false;
+            }
+            dirty |= app.run_pending();
+        }
+
         if app.take_network_request() {
             let result = session.run_network_settings();
             app.monitor.refresh_wifi_now();
@@ -220,7 +235,21 @@ fn run(session: &mut TerminalSession, mut app: App) -> Result<()> {
 
         if last_tick.elapsed() >= TICK {
             last_tick = Instant::now();
+
+            // A due source such as Bluetooth may block for several seconds.
+            // Draw its label first so the last frame on screen explains the
+            // pause instead of looking like a frozen dashboard.
+            let show_activity = app.begin_tick_activity();
+            if show_activity {
+                app.hits = draw(session, &app)?;
+                dirty = false;
+            }
+
             dirty |= app.tick();
+
+            if show_activity {
+                dirty = true;
+            }
         }
 
         dirty |= app.update_clock();

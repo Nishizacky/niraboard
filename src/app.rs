@@ -7,6 +7,7 @@ use ratatui::crossterm::event::{
 use ratatui::layout::Position;
 
 use crate::actions;
+use crate::bluetooth::Panel as BluetoothPanel;
 use crate::config::Config;
 use crate::event::Event;
 use crate::notifications::Center;
@@ -57,18 +58,20 @@ pub enum Card {
     Memory,
     Disk,
     Network,
+    Bluetooth,
     Power,
     Brightness,
     Audio,
 }
 
 impl Card {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Battery,
         Self::Cpu,
         Self::Memory,
         Self::Disk,
         Self::Network,
+        Self::Bluetooth,
         Self::Power,
         Self::Brightness,
         Self::Audio,
@@ -84,6 +87,7 @@ impl Card {
             "memory" | "ram" => Some(Self::Memory),
             "disk" | "storage" | "filesystem" => Some(Self::Disk),
             "network" | "wifi" => Some(Self::Network),
+            "bluetooth" | "bt" | "bluetoothctl" => Some(Self::Bluetooth),
             "power" | "profile" | "powerprofile" => Some(Self::Power),
             "brightness" | "backlight" => Some(Self::Brightness),
             "audio" | "volume" => Some(Self::Audio),
@@ -98,6 +102,7 @@ impl Card {
             Self::Memory => "memory",
             Self::Disk => "disk",
             Self::Network => "network",
+            Self::Bluetooth => "bluetooth",
             Self::Power => "power",
             Self::Brightness => "brightness",
             Self::Audio => "audio",
@@ -186,6 +191,24 @@ impl StatusMessage {
     }
 }
 
+/// Work that is about to block the event loop.
+///
+/// The action is queued instead of being executed inside the key handler so
+/// the main loop can draw [`App::activity_text`] first. That way a slow BlueZ
+/// D-Bus call or metric refresh still tells the user what it is doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingAction {
+    RefreshAll,
+    BluetoothRefresh,
+    BluetoothPower,
+    BluetoothSelected,
+}
+
+#[derive(Debug, Clone)]
+struct Activity {
+    label: String,
+}
+
 pub struct App {
     pub monitor: Monitor,
     pub focus: Focus,
@@ -197,8 +220,11 @@ pub struct App {
     pub show_quit_confirmation: bool,
     pub identity: String,
     pub notifications: Center,
+    pub bluetooth: BluetoothPanel,
     clock_text: String,
     network_requested: bool,
+    activity: Option<Activity>,
+    pending: Option<PendingAction>,
 }
 
 impl Default for App {
@@ -230,8 +256,11 @@ impl App {
             show_quit_confirmation: false,
             identity: identity(),
             notifications: Center::default(),
+            bluetooth: BluetoothPanel::default(),
             clock_text,
             network_requested: false,
+            activity: None,
+            pending: None,
         }
     }
 
@@ -272,6 +301,90 @@ impl App {
         self.monitor.refresh_all()
     }
 
+    /// Queue the first metric read so the startup screen can show progress.
+    pub fn begin_initial_refresh(&mut self) {
+        self.queue(PendingAction::RefreshAll, "Loading system data...");
+    }
+
+    /// Queue work that may block. The event loop draws the new activity label
+    /// before calling [`App::run_pending`].
+    fn queue(&mut self, action: PendingAction, label: impl Into<String>) {
+        self.activity = Some(Activity {
+            label: label.into(),
+        });
+        self.pending = Some(action);
+    }
+
+    /// Whether a queued action still needs to run.
+    pub fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Description of the blocking work the app is currently showing.
+    pub fn activity_text(&self) -> Option<&str> {
+        self.activity
+            .as_ref()
+            .map(|activity| activity.label.as_str())
+    }
+
+    /// Execute queued work after the caller has drawn the progress message.
+    pub fn run_pending(&mut self) -> bool {
+        let Some(action) = self.pending.take() else {
+            self.activity = None;
+            return false;
+        };
+
+        match action {
+            PendingAction::RefreshAll => {
+                self.refresh_all();
+                self.set_status("Refreshed".to_owned(), StatusLevel::Info);
+            }
+            PendingAction::BluetoothRefresh => {
+                self.bluetooth.refresh_now();
+                self.sync_bluetooth_metrics();
+            }
+            PendingAction::BluetoothPower => {
+                self.bluetooth.toggle_power();
+                self.sync_bluetooth_metrics();
+            }
+            PendingAction::BluetoothSelected => {
+                self.bluetooth.toggle_selected();
+                self.sync_bluetooth_metrics();
+            }
+        }
+
+        self.activity = None;
+        self.sync_bluetooth_status();
+        true
+    }
+
+    /// Set an activity label before a scheduled refresh. The caller should
+    /// draw once before [`App::tick`] and once again afterwards.
+    pub fn begin_tick_activity(&mut self) -> bool {
+        if self.pending.is_some() || self.activity.is_some() {
+            return false;
+        }
+
+        let label = if self.bluetooth.is_open() && self.bluetooth.refresh_due() {
+            if self.bluetooth.is_scanning() {
+                Some("Reading Bluetooth scan results...")
+            } else {
+                Some("Refreshing Bluetooth state...")
+            }
+        } else {
+            self.monitor.due_activity_label()
+        };
+
+        if let Some(label) = label {
+            self.activity = Some(Activity {
+                label: label.to_owned(),
+            });
+            true
+        } else {
+            false
+        }
+    }
+
     /// Take a pending request to launch the interactive network editor.
     pub fn take_network_request(&mut self) -> bool {
         std::mem::take(&mut self.network_requested)
@@ -287,6 +400,7 @@ impl App {
 
     /// Called once per tick. Returns true when a redraw is needed.
     pub fn tick(&mut self) -> bool {
+        let had_activity = self.activity.take().is_some();
         let mut changed = self.monitor.tick();
 
         if self.status.as_ref().is_some_and(StatusMessage::is_expired) {
@@ -294,7 +408,13 @@ impl App {
             changed = true;
         }
 
-        changed | self.notifications.tick()
+        if self.bluetooth.tick() {
+            self.sync_bluetooth_metrics();
+            self.sync_bluetooth_status();
+            changed = true;
+        }
+
+        changed | had_activity | self.notifications.tick()
     }
 
     pub fn handle_event(&mut self, event: Event) -> bool {
@@ -325,6 +445,10 @@ impl App {
 
         if self.notifications.is_open() {
             return self.handle_notification_key(key);
+        }
+
+        if self.bluetooth.is_open() {
+            return self.handle_bluetooth_key(key);
         }
 
         match key.code {
@@ -362,9 +486,9 @@ impl App {
                 self.network_requested = true;
                 true
             }
+            KeyCode::Char('b') | KeyCode::Char('B') => self.toggle_bluetooth(),
             KeyCode::Char('r') | KeyCode::Char('R') => {
-                let _ = self.refresh_all();
-                self.set_status("Refreshed".to_owned(), StatusLevel::Info);
+                self.queue(PendingAction::RefreshAll, "Refreshing system data...");
                 true
             }
             KeyCode::Char('1') => {
@@ -439,6 +563,125 @@ impl App {
         }
     }
 
+    /// Keys owned by the open Bluetooth panel. Dashboard shortcuts are ignored
+    /// while the panel owns input.
+    fn handle_bluetooth_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('b') | KeyCode::Char('B') => {
+                self.bluetooth.close();
+                true
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
+                self.bluetooth.move_selection(1);
+                true
+            }
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
+                self.bluetooth.move_selection(-1);
+                true
+            }
+            KeyCode::PageDown => {
+                self.bluetooth.move_selection(5);
+                true
+            }
+            KeyCode::PageUp => {
+                self.bluetooth.move_selection(-5);
+                true
+            }
+            KeyCode::Home => {
+                self.bluetooth.select_start();
+                true
+            }
+            KeyCode::End => {
+                self.bluetooth.select_end();
+                true
+            }
+            KeyCode::Enter => {
+                if let Some((label, connected)) = self.bluetooth.selected_label() {
+                    let verb = if connected {
+                        "Disconnecting"
+                    } else {
+                        "Connecting"
+                    };
+                    self.queue(
+                        PendingAction::BluetoothSelected,
+                        format!("{verb} {label}..."),
+                    );
+                }
+                true
+            }
+            KeyCode::Char('p') | KeyCode::Char('P') => {
+                let label = if self
+                    .bluetooth
+                    .adapter()
+                    .is_some_and(|adapter| adapter.powered)
+                {
+                    "Powering Bluetooth off..."
+                } else {
+                    "Powering Bluetooth on..."
+                };
+                self.queue(PendingAction::BluetoothPower, label);
+                true
+            }
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                self.bluetooth.scan();
+                true
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                self.queue(
+                    PendingAction::BluetoothRefresh,
+                    "Refreshing Bluetooth state...",
+                );
+                true
+            }
+            KeyCode::Char('q') | KeyCode::Char('Q') => {
+                self.show_quit_confirmation = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn toggle_bluetooth(&mut self) -> bool {
+        let opened = self.bluetooth.toggle();
+        if opened {
+            self.queue(
+                PendingAction::BluetoothRefresh,
+                "Reading Bluetooth state...",
+            );
+        }
+        true
+    }
+
+    /// Keep the dashboard card in step with a read made by the open panel.
+    fn sync_bluetooth_metrics(&mut self) {
+        let data = self.bluetooth.data().cloned();
+        if let Some(data) = data {
+            self.monitor.metrics.bluetooth = Some(data);
+        }
+    }
+
+    /// Copy an action result from the panel into the dashboard info bar.
+    fn sync_bluetooth_status(&mut self) {
+        let notice = self
+            .bluetooth
+            .notice()
+            .map(|(text, is_error)| (text.to_owned(), is_error));
+        let error = self.bluetooth.error().map(str::to_owned);
+
+        if let Some((text, is_error)) = notice {
+            self.set_status(
+                text,
+                if is_error {
+                    StatusLevel::Error
+                } else {
+                    StatusLevel::Info
+                },
+            );
+        } else if let Some(error) = error {
+            self.set_status(format!("Bluetooth: {error}"), StatusLevel::Error);
+        }
+    }
+
     fn toggle_notifications(&mut self) -> bool {
         self.notifications.toggle();
         true
@@ -455,6 +698,57 @@ impl App {
 
         let position = Position::new(mouse.column, mouse.row);
         let action = self.hits.action_at(mouse.column, mouse.row);
+
+        if self.bluetooth.is_open() {
+            match action {
+                Some(ClickAction::ToggleBluetoothPower) => {
+                    let label = if self
+                        .bluetooth
+                        .adapter()
+                        .is_some_and(|adapter| adapter.powered)
+                    {
+                        "Powering Bluetooth off..."
+                    } else {
+                        "Powering Bluetooth on..."
+                    };
+                    self.queue(PendingAction::BluetoothPower, label);
+                    return true;
+                }
+                Some(ClickAction::ScanBluetooth) => {
+                    self.bluetooth.scan();
+                    return true;
+                }
+                Some(ClickAction::ToggleBluetoothDevice(index)) => {
+                    self.bluetooth.select(index);
+                    if let Some((label, connected)) = self.bluetooth.selected_label() {
+                        let verb = if connected {
+                            "Disconnecting"
+                        } else {
+                            "Connecting"
+                        };
+                        self.queue(
+                            PendingAction::BluetoothSelected,
+                            format!("{verb} {label}..."),
+                        );
+                    }
+                    return true;
+                }
+                _ => {}
+            }
+
+            // A click inside the panel is consumed; a click outside closes it
+            // without activating whatever card was underneath.
+            let inside = self
+                .hits
+                .bluetooth_window()
+                .is_some_and(|rect| rect.contains(position));
+            if inside {
+                return false;
+            }
+
+            self.bluetooth.close();
+            return true;
+        }
 
         if let Some(ClickAction::ToggleNotifications) = action {
             return self.toggle_notifications();
@@ -524,8 +818,13 @@ impl App {
                 self.network_requested = true;
                 true
             }
+            ClickAction::OpenBluetooth => self.toggle_bluetooth(),
             ClickAction::ToggleNotifications => self.toggle_notifications(),
-            ClickAction::SelectNotificationTab(_) | ClickAction::SelectNotification(_) => false,
+            ClickAction::ToggleBluetoothPower
+            | ClickAction::ScanBluetooth
+            | ClickAction::ToggleBluetoothDevice(_)
+            | ClickAction::SelectNotificationTab(_)
+            | ClickAction::SelectNotification(_) => false,
         }
     }
 
@@ -671,6 +970,7 @@ impl App {
 mod tests {
     use super::*;
     use crate::notifications::{DesktopNotification, Tab, Urgency};
+    use crate::system::bluetooth::{Adapter, Bluetooth, Device};
 
     #[test]
     fn focus_cycles_in_both_directions() {
@@ -808,6 +1108,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn refresh_key_queues_work_and_shows_activity() {
+        let mut app = App::new();
+
+        assert!(!app.has_pending());
+        assert!(!app.run_pending());
+
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)));
+
+        assert_eq!(app.activity_text(), Some("Refreshing system data..."));
+        assert!(app.has_pending());
+    }
+
+    #[test]
+    fn opening_bluetooth_defers_the_blocking_read() {
+        let mut app = App::new();
+
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)));
+
+        assert!(app.bluetooth.is_open());
+        assert_eq!(app.activity_text(), Some("Reading Bluetooth state..."));
+        assert!(app.has_pending());
+    }
+
+    #[test]
+    fn scheduled_refresh_exposes_activity_before_it_runs() {
+        let mut app = App::new();
+
+        assert!(app.begin_tick_activity());
+        assert_eq!(app.activity_text(), Some("Refreshing Bluetooth state..."));
+    }
+
     fn notification(id: u32, summary: &str) -> DesktopNotification {
         DesktopNotification {
             id,
@@ -846,6 +1178,57 @@ mod tests {
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn bluetooth_keys_move_the_selection_and_close_the_panel() {
+        let mut app = App::new();
+        app.bluetooth.force_open();
+        app.bluetooth.set_data(Bluetooth {
+            adapter: Some(Adapter {
+                path: "/org/bluez/hci0".to_owned(),
+                address: "AA:BB:CC:DD:EE:FF".to_owned(),
+                alias: Some("laptop".to_owned()),
+                powered: true,
+                discoverable: false,
+                discovering: false,
+            }),
+            devices: vec![
+                Device {
+                    path: "/org/bluez/hci0/dev_00_00_00_00_00_01".to_owned(),
+                    address: "00:00:00:00:00:01".to_owned(),
+                    name: Some("one".to_owned()),
+                    connected: false,
+                },
+                Device {
+                    path: "/org/bluez/hci0/dev_00_00_00_00_00_02".to_owned(),
+                    address: "00:00:00:00:00:02".to_owned(),
+                    name: Some("two".to_owned()),
+                    connected: true,
+                },
+            ],
+        });
+
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+        assert_eq!(app.bluetooth.selected(), 1);
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)));
+        assert_eq!(app.bluetooth.selected(), 0);
+
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(!app.bluetooth.is_open());
+        assert!(!app.show_quit_confirmation);
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn bluetooth_panel_ignores_dashboard_shortcuts() {
+        let mut app = App::new();
+        app.bluetooth.force_open();
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE)));
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)));
+        assert_eq!(app.layout, LayoutMode::Vertical);
+        assert!(app.bluetooth.is_open());
     }
 
     #[test]

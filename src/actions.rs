@@ -42,3 +42,87 @@ pub fn toggle_mute() -> Result<()> {
 pub fn open_network_settings() -> Result<()> {
     command::run_interactive("nmtui", &[])
 }
+
+pub fn set_bluetooth_power(adapter_path: &str, powered: bool) -> Result<()> {
+    command::run(
+        "busctl",
+        &[
+            "--system",
+            "--timeout=10",
+            "set-property",
+            "org.bluez",
+            adapter_path,
+            "org.bluez.Adapter1",
+            "Powered",
+            "b",
+            if powered { "true" } else { "false" },
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn connect_bluetooth(device_path: &str) -> Result<()> {
+    command::run(
+        "busctl",
+        &[
+            "--system",
+            "--timeout=15",
+            "call",
+            "org.bluez",
+            device_path,
+            "org.bluez.Device1",
+            "Connect",
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn disconnect_bluetooth(device_path: &str) -> Result<()> {
+    command::run(
+        "busctl",
+        &[
+            "--system",
+            "--timeout=15",
+            "call",
+            "org.bluez",
+            device_path,
+            "org.bluez.Device1",
+            "Disconnect",
+        ],
+    )?;
+    Ok(())
+}
+
+/// Start a discovery run through BlueZ. The panel stops it after its scan
+/// window; [`stop_bluetooth_scan`] is also called on close and drop.
+pub fn start_bluetooth_scan(adapter_path: &str) -> Result<()> {
+    command::run(
+        "busctl",
+        &[
+            "--system",
+            "--timeout=5",
+            "call",
+            "org.bluez",
+            adapter_path,
+            "org.bluez.Adapter1",
+            "StartDiscovery",
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn stop_bluetooth_scan(adapter_path: &str) -> Result<()> {
+    command::run(
+        "busctl",
+        &[
+            "--system",
+            "--timeout=5",
+            "call",
+            "org.bluez",
+            adapter_path,
+            "org.bluez.Adapter1",
+            "StopDiscovery",
+        ],
+    )?;
+    Ok(())
+}
